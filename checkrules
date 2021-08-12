@@ -1,0 +1,299 @@
+#!/usr/bin/perl -I lib
+
+# the serverM system rules files syntax checker V.1
+# D. Scholefield 2004, 2005, 2006 (www.port80.com)
+# Version 2.80 (Linux/Mac OS X/BSD)
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+# usage: checkrules [-r] [PATH|FILE]
+# where '-r' will give a full report on the rules parsed
+# and 'PATH' points to the directory with the rules files
+# or 'FILE' points to a specific file
+
+BEGIN {
+push @INC, './lib';}
+
+use strict;
+use parse_rules;
+use parse_config;
+use Cwd;
+use Data::Dumper;
+use Digest::MD5 qw(md5_hex);
+
+my $directory = "";
+my $full_report = 0;
+my @filestocheck = ();
+my $rfConfig=[];
+our $debug = 0;
+
+our $md5=0;
+
+our @rules = ();
+our @errors = ();
+my $realdump=0;
+my $cdir = cwd();
+
+print "\nStart rules checking...\n";
+
+ARG: foreach my $arg (@ARGV)
+{
+	print "processing arg $arg\n";
+	if ($arg eq "-r")
+		{ $full_report = 1 ;
+			 next ARG; }
+	if ($arg eq "-x")
+		{ $realdump=1;
+			 next ARG; }
+	if ($arg eq "-h")
+		{ usage();
+			 exit(); }
+	
+	if ($arg eq '-md5')
+		{ $md5=1;
+			next ARG; }
+		
+	if ($arg =~ /c:\'?([^\']+)\'?/)
+	{
+		my $cfile=$1;
+		if (! -e "$cfile/config.txt")
+		{
+			print "can't find config file '$cfile/config.txt', aborting...\n";
+			exit;
+		}
+		else
+		{
+			my ($er_result, $rfErrorList, $LocalrfValStruct) = parse_config::parse(0,0,"$cfile");
+			$rfConfig=$LocalrfValStruct;
+		}
+		next ARG;
+	}
+		
+	if (-d $arg)
+		{ $directory = $arg;
+			next ARG;}
+			
+	if (-T $arg)
+		{ 
+			if ($arg =~ /^[a-zA-Z]:/) 
+			{ push @filestocheck, $arg;}
+			else
+			{ push @filestocheck, "$cdir/$arg";}
+			next ARG; }
+			
+	usage();
+	exit();
+}
+
+if (($directory eq "") && (@filestocheck == ()))
+{
+	if (-e "rules.txt")
+	{ push @filestocheck, "$cdir/rules.txt"; }
+	else
+	{ print "Can't find rules.txt in current directory $cdir!\n"; usage(); exit();}
+}
+	
+# expand the directory into all files to check
+# first check if the directory is a ruleslib
+# directory
+
+if ($directory ne "")
+{
+	if ($directory =~ /(?:ruleslib|.*\\ruleslib)/)
+		{ # it is, so expand
+			$directory = "$directory/*.txt";
+			$directory = "$cdir/$directory" if ($directory !~ /^[a-zA-Z]:/);
+			$directory =~ s/\\/\//g;
+			print "Globbing files in $directory\n" if ($debug);
+			$directory =~ s/ /\\ /g;
+			my @allfiles = glob($directory);
+			foreach my $file (@allfiles) {$file =~ s/^\'//; $file =~ s/\'$//; print "-> $file\n"; push @filestocheck, $file;}  }
+	else
+		{  $directory = "$cdir/$directory" if ($directory !~ /^[a-zA-Z]:/);
+			 if (! -e "$directory/rules.txt")
+			 	{  	print "Can't find rules.txt in directory $directory!\n"; exit(); }
+			 push @filestocheck, "$directory/rules.txt";
+			 if (-d "$directory/ruleslib")
+			 {
+			 	$directory = "$directory/ruleslib/*.txt";
+			 	$directory = "\'$directory\'" if ($directory =~ / /);
+			 	$directory =~ s/\\/\//g;
+			 	print "Globbing files in $directory\n" if ($debug);
+			 	my @allfiles = glob($directory);
+			foreach my $file (@allfiles) {$file =~ s/^\'//; $file =~ s/\'$//; push @filestocheck, $file;}  
+			 }
+		}
+}
+
+	
+# sort out slash-crap
+foreach my $index (0..$#filestocheck) {$filestocheck[$index] =~ s/\\/\//g;}
+if ($debug)
+{
+	print "Now checking files:\n";
+	foreach my $file (@filestocheck)
+	{
+		print "\t$file\n";
+	}
+}
+
+# ok, we are ready to rock and roll!
+
+my %shown = ();
+my ($error_result, $rfErrors, $LocalrfValues, $LocalrfOnceOnly, $LocalrfOnceUntilFail, $rfLocalOrder, $rfLocalIfAndConditions, $rfLocalIfOrConditions, $rfLocalEvery, $rfLocalEveryAt, $rfRules_files);
+foreach my $file (@filestocheck)
+{
+	my $pfile = $file;
+	my $in_dir = "";
+	$pfile =~ s/\//\\/g;
+	if ($pfile =~ /([a-z]:.*)\\([^\\]+)$/i)
+	{
+		$in_dir = $1;
+		$pfile = $2;
+		if ((!$shown{$in_dir}) && ($in_dir ne "")) {print "In directory $in_dir\n"; $shown{$in_dir}=1;}
+	}
+
+	print "Checking file $file: ";
+	
+	($error_result, $rfErrors, $LocalrfValues, $LocalrfOnceOnly, $LocalrfOnceUntilFail, $rfLocalOrder, $rfLocalIfAndConditions, $rfLocalIfOrConditions, $rfLocalEvery, $rfLocalEveryAt, $rfRules_files) = parse_rules::parse(3,1,$file,$rfConfig);
+			
+	if ($realdump)
+	{
+		print "\n-------------------------DUMPING --------------------------\n\n";
+		print "Rules\n";
+		mydump($LocalrfValues);
+		print "\nOnce only\n";
+		mydump($LocalrfOnceOnly);
+		print "\nOnce Until Fail\n";
+		mydump($LocalrfOnceUntilFail);
+		print "\nIf\n";
+		mydump($rfLocalIfAndConditions);
+		print "\nOr\n";
+		mydump($rfLocalIfOrConditions);
+		print "\nEvery\n";
+		mydump($rfLocalEvery);
+		print "\nEvery (at)\n";
+		mydump($rfLocalEveryAt);
+	}
+		
+	foreach my $rules (@$rfLocalOrder)
+	{ push @rules, "$file: $rules";}
+	
+	if ($error_result)
+	{
+		print "Parsed ok\n";
+	}
+	else
+	{
+		print "Errors!\n";
+		foreach my $ermsg (@$rfErrors)
+		{push @errors, $ermsg;}
+	}
+	
+if ($md5)
+{
+	my @rule_names= keys %{$LocalrfValues->{'type'}};
+	foreach my $name (@rule_names)
+	{
+		my $to_dump;
+		my $rf=[	$LocalrfValues->{'constraints'}->{$name},
+					$LocalrfValues->{'ignores'}->{$name},
+					$LocalrfValues->{'value'}->{$name},
+					$LocalrfValues->{'value'}->{$name},
+					$LocalrfValues->{'alarm'}->{$name},
+					$LocalrfValues->{'type'}->{$name},
+					$LocalrfValues->{'severity'}->{$name} ];
+					
+		eval {my @list=$rf; my $d = Data::Dumper->new(\@list);
+		$to_dump = $d->Dump;};
+		$to_dump = md5_hex($to_dump);
+		print "$name -> $to_dump\n";
+	}
+}
+	
+}
+if ($full_report)
+{
+	print "\n\nREPORT (in order of evaluation)\n"; do_report();
+}
+
+
+	
+if (@errors != ()) {print "\n\nERRORS\n"; print_errors();}
+
+exit();
+
+sub do_report
+{
+	foreach my $rule (@rules)
+	{
+		if ($rule =~ /(.*)\/ruleslib\//)
+		{
+			$rule =~ s/$1//;
+		}
+		else
+		{
+			if ($rule =~ /(.*)\/[^\/]+/)
+			{
+				$rule =~ s/$1//;
+			}
+		}
+		
+		print "\tOK Rule -> $rule\n";
+	}
+}
+
+sub print_errors
+{
+	foreach my $msg (@errors)
+	{
+		my $pmsg = $msg;
+	if ($pmsg =~ /\s*\(([^\)]+)\).*/)
+	{ my $olddir = $1; my $keep=$1;
+		$olddir =~ s/\\/\//g;
+		$pmsg =~ s/$keep/$olddir/g;}
+		
+	print " -> $pmsg\n";}
+}
+
+sub usage
+{
+	print "\nUSAGE\n";
+	print "checkrules [-r] [-h] [PATH|PATH\\ruleslib|ruleslib|FILE]\n\n";
+	print "\t-h\tshows this help message\n";
+	print "\t-md5\tcalculates MD5 hash for each rule\n";
+	print "\tc:'<dir>' defines the directory holding the master config for serverM\n";
+	print "\t-r\tdisplays correctly parsed rules as well as errors\n";
+	print "\tFILE\tchecks specific file\n";
+	print "\tPATH\tchecks rules.txt in path, and *.txt in PATH\\ruleslib\n";
+	print "\truleslib checks *.txt in ruleslib dir in current dir\n";
+	print "\tPATH\\ruleslib checks *.txt in ruleslib dir in PATH\n\n";
+	print "\tPATH may be absolute (from drive spec e.g. D:\\...)\n";
+	print "\tor relative to current dir\n\n";
+	
+}
+
+sub mydump{
+	my $rf = shift;
+	
+	my $to_dump;
+	eval {my @list=($rf); my $d = Data::Dumper->new(\@list);
+	$to_dump = $d->Dump;};
+	if ($@) {print "Problem dumping $@";}
+	else {print "dumping hash: $to_dump";}
+}
+
+	
+			 

@@ -1,0 +1,1366 @@
+#!/usr/bin/perl -I lib
+
+# the serverM configuration report generation system
+# D. Scholefield 2004, 2005, 2006 (www.port80.com)
+# Version 2.80 (Linux/Mac OS X/BSD)
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+use strict;
+
+use parse_rules;
+use parse_config;
+use htmltoolkit;
+
+
+my $path="";
+my $root="";
+my $check_cycle=0;
+my $limit=20;
+my $rules=0;
+my $log=0;
+my $config=0;
+my %results;
+my ($er_result, $rfErrorList, $LocalrfValStruct);
+
+print "htmlreport starting execution\n";
+
+my $machine = "unresolved host";
+my @hostname_tmp = `echo \$HOSTNAME`;
+    if (@hostname_tmp[0] =~ /[A-Z0-9]/i)
+    {
+    	$machine = @hostname_tmp[0];
+    }
+
+
+my $nowDate = convert_timestamp();
+
+get_args();
+$path =~ s/\s+$//;
+$path =~ s/\\$//;
+
+my @errors=();
+
+if ((!$config) && (!$log) && (!$rules))
+{
+	push @errors, "you have to specify at lease one of 'config' 'log' or 'rules' in parameters";
+}
+
+if (!$root)
+{
+	push @errors, "you have to specify the HTML root path using the 'root:' parameter";
+}
+
+if (!$path)
+{
+	push @errors, "you have to specify the path to the serverM install using the 'path:' parameter";
+}
+
+
+
+if ($root)
+{
+	if (! -d $root)
+	{
+		push @errors, "can't find html root directory at $root";
+	}
+}
+
+if (@errors != ())
+{
+	do_error_page(\@errors);
+	
+}
+
+# first we need to be able to access the image files
+# needed by the web page so we will copy them
+
+my $command = 'cp "'.$path.'/docs/report.gif" "'.$root.'/report.gif"';
+
+my @results = `$command`;
+#print $command, "\n";
+#print @results, "\n";
+
+our $install_path = $path;
+# $install_path =~ s/\\/\//g;
+
+%results = %{htmltoolkit::get_log_stats("$path/log", $limit)};
+($er_result, $rfErrorList, $LocalrfValStruct) = parse_config::parse(0,1,"$path/config");
+parse_rules::init();
+my $file = "$path/config/rules.txt";
+
+my ($error_result, $rfErrors, $LocalrfValues, $LocalrfOnceOnly, $LocalrfOnceUntilFail, $rfLocalOrder, $rfLocalIfAndConditions, $rfLocalIfOrConditions, $rfLocalEvery, $rfLocalEveryAt, $rfRules_files, $rfGlobal_ignores, $rfErrorReport, $rfAttime, $rfOnday, $rfThrottle, $rfLocalCycle, $rfLocalInitial) = parse_rules::parse(3,0,$file,$LocalrfValStruct);
+
+create_main();
+if ($log)
+{
+	create_alarms();
+	create_errors();
+	create_logentries();
+	create_logpage();
+}
+
+if ($rules)
+{create_rules();}
+	
+if ($config)
+{
+	create_config();}	
+
+$nowDate = convert_timestamp();
+print "htmlreport terminated at $nowDate\n";
+	
+exit;
+
+sub do_error_page
+{
+	my $er_msg = shift;
+	my @errors = @$er_msg;
+	
+	print "An error occurred in command 'htmlreport'\n";
+	foreach (@errors)
+	{
+		print "Error: $_\n";
+	}
+	exit;
+}
+sub get_args
+{
+	ARG: foreach my $arg (@ARGV)
+	{
+		if ($arg =~ /path:(.*)/)
+		{
+			$path = $1;
+			$path =~ s/^\"//;
+			$path =~ s/\"$//;
+			next ARG;
+		}
+		
+		if ($arg =~ /root:(.*)/)
+		{
+			$root = $1;
+			$root =~ s/^\"//;
+			$root =~ s/\"$//;
+			next ARG;
+		}
+		
+		
+		if ($arg =~ /cc:(.*)/)
+		{
+			$check_cycle = $1;
+			next ARG;
+		}
+		
+		if ($arg =~ /path:(.*)/)
+		{
+			$path = $arg;
+			$path =~ s/^\"//;
+			$path =~ s/\"$//;
+			next ARG;
+		}
+		
+		if ($arg =~ /limit:(.*)/)
+		{
+			$limit = $1;
+			next ARG;
+		}
+		
+		$rules = 1 if ($arg eq "rules");
+		$log = 1 if ($arg eq "log");
+		$config = 1 if ($arg eq "config");
+	}
+}
+
+sub convert_timestamp
+{
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst);
+  if (@_ == ())
+  {($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime();}
+  else
+  {($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime(shift);}
+	$year+=1900;
+	my $monName = (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[$mon];
+	my $dayName = (qw(Sun Mon Tue Wed Thu Fri Sat))[$wday];
+	
+	if ($sec<10) {$sec="0$sec";}
+	if ($min<10) {$min="0$min";}
+	if ($hour<10) {$hour="0$hour";}
+	
+	return "$dayName $mday $monName $year : $hour:$min:$sec";
+
+}
+
+sub create_main
+{
+	my $sstatus;
+	my $service_colour;
+	($sstatus, $service_colour) = read_service();
+	
+	open(MainFile, ">$root/main.html") || do_error_page(["Can't open main.html for writing at $root"]);
+	
+	print MainFile <<MAINTOP;
+	<html><head><title>serverM installation report</title>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" />
+<meta http-equiv="Content-Language" content="en" />
+<meta name="Description" content="" />
+<meta name="Keywords" content="serverM installation report" />
+<STYLE>
+<!--
+A{text-decoration:none}
+-->
+</STYLE>
+</head><body bgcolor="#66cc66" leftmargin="0" topmargin="0" marginwidth="0" marginheight="0" alink="#339933" vlink="#339933" link="#339933">
+<p align="right">
+<table border="1" width="95%" bgcolor="#ffffff" cellpadding="10" cellspacing="0" height="100%">
+<tr>
+<td valign="top" bgcolor="#ffffff">
+	<table border="0" width="100%" bgcolor="#ffffff" cellpadding="0" cellspacing="0">
+		<tr>
+			<td bgcolor="#ffffff" valign="top" colspan="2">
+			<table cellpadding="2" cellspacing="2" width="100%">
+				<tr>
+					<td align="left" bgcolor="#666666" width="20%"><font face="Verdana" size="1" color="#00cc00"><b>></b></font><a href="main.html"><font face="Verdana" size="1" color="#ffffff">Home</a></font></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="log.html"><font face="Verdana" size="1" color="#ffffff">Log File Analysis</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="rules.html"><font face="Verdana" size="1" color="#ffffff">Rules Analysis</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="config.html"><font face="Verdana" size="1" color="#ffffff">Configuration</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="http://www.port80.com/serverM/index.html"><font face="Verdana" size="1" color="#ffffff">serverM website</font></a></td>
+				</tr>
+				</table>
+				
+				<table border="0" width="100%" bgcolor="#ffffff" cellpadding="0" cellspacing="0">
+		<tr>
+			<td bgcolor="#ffffff" valign="top"><font face="Verdana" size="2" color="#000000"><p><br><strong>serverM system report<p><font face="Verdana" size="1" color="#000000">
+			Server: $machine<br>
+			Date page created: $nowDate<br>
+			Service: </font><font face="Verdana" size="1" color="$service_colour">$sstatus
+			<br></font><br></font></td>
+			<td align="right">
+			<table border="0" cellspacing="0" cellpadding="1"><tr><td><p><br><img src="report.gif" hspace="50"></td></tr><tr><td align="center"><font face="Verdana" size="1" color="#999999">Protected by</font></td></tr>
+			<tr><td align="center"><font face="Verdana" size="1" color="#999999">serverM</font></td></tr></table></td>
+		</tr>
+		
+		</table>
+</td></tr>
+			
+MAINTOP
+
+
+print MainFile '<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+';
+
+my $bgcolor="#eeffee";
+my $count = 1;
+
+
+print MainFile '<tr>';
+print MainFile '<td bgcolor="#cccccc" valign="top" width="50%"><font face="Verdana" size="1" color="#000000">File</font></td>';
+print MainFile '<td bgcolor="#cccccc" valign="top" width="30%"><font face="Verdana" size="1" color="#000000">Modified</font></td>';
+print MainFile '<td bgcolor="#cccccc" valign="top" width="20%"><font face="Verdana" size="1" color="#000000">Errors</font></td>';
+print MainFile '</tr>';
+
+my $file="$path/config/config.txt";
+$file =~ s/\\/\//g;
+
+my $file_change = -M $file;
+$file_change = time - ($file_change * 24 * 60 * 60);
+$file_change = convert_timestamp($file_change);
+my ($warn_colour, $warn_val);
+if (!$er_result)
+{$warn_colour='#cc0000'; $warn_val="yes";}
+else {$warn_colour='#00cc00'; $warn_val="no";}
+
+print MainFile '<tr>';
+print MainFile '<td bgcolor="#eeffee" valign="top" width="50%"><font face="Verdana" size="1" color="#000000">config</font></td>';
+print MainFile '<td bgcolor="#eeffee" valign="top" width="30%"><font face="Verdana" size="1" color="#000000">'.$file_change.'</font></td>';
+print MainFile '<td bgcolor="#eeffee" valign="top" width="20%"><font face="Verdana" size="1" color="'.$warn_colour.'">'.$warn_val.'</font></td>';
+print MainFile '</tr>';
+
+# now we need to get the latest rules file changes
+my $last_mtime = 0;
+my $last_fname = "";
+
+foreach my $rulesfile (keys %$rfRules_files)
+{
+	my $mtime = -M $rulesfile;
+	if ($mtime > $last_mtime)
+	{ $last_mtime = $mtime;
+		$last_fname = $rulesfile;
+	}
+}
+
+$last_fname =~ s/\//\\/g;
+
+$last_fname =~ s/$path//i;
+
+$file_change = time - $last_mtime;
+$file_change = convert_timestamp($file_change);
+if (!$error_result)
+{$warn_colour='#cc0000'; $warn_val="yes";}
+else {$warn_colour='#00cc00'; $warn_val="no";}
+
+print MainFile '<tr>';
+print MainFile '<td bgcolor="#ccffcc" valign="top" width="50%"><font face="Verdana" size="1" color="#000000">rules files</font></td>';
+print MainFile '<td bgcolor="#ccffcc" valign="top" width="30%"><font face="Verdana" size="1" color="#000000">'.$file_change.'</font></td>';
+print MainFile '<td bgcolor="#ccffcc" valign="top" width="20%"><font face="Verdana" size="1" color="'.$warn_colour.'">'.$warn_val.'</font></td>';
+print MainFile '</tr>';
+
+
+$file="$path/log/log.txt";
+$file =~ s/\\/\//g;
+
+$file_change = -M $file;
+$file_change = time - ($file_change * 24 * 60 * 60);
+$file_change = convert_timestamp($file_change);
+
+
+$warn_colour='#00cc00';
+
+print MainFile '<tr>';
+print MainFile '<td bgcolor="#eeffee" valign="top" width="50%"><font face="Verdana" size="1" color="#000000">log</font></td>';
+print MainFile '<td bgcolor="#eeffee" valign="top" width="30%"><font face="Verdana" size="1" color="#000000">'.$file_change.'</font></td>';
+print MainFile '<td bgcolor="#eeffee" valign="top" width="20%"><font face="Verdana" size="1" color="'.$warn_colour.'"> N/A </font></td>';
+print MainFile '</tr>';
+
+
+print MainFile '</table></td></tr></table>';
+	
+if (@errors != ())
+{
+	print MainFile '<br><p><br>';
+	
+	print MainFile '<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+';
+
+my $bgcolor="#eeffee";
+my $count = 1;
+
+
+print MainFile '<tr>';
+print MainFile '<td bgcolor="#cccccc" valign="top" width="50%"><font face="Verdana" size="1" color="#cc0000">There were errors whilst creating this HTML report!</font></td>';
+print MailFile '</tr>';
+
+foreach my $er_msg (@errors)
+{
+	print MainFile '<tr>';
+print MainFile '<td bgcolor="#ffffff" valign="top" width="50%"><font face="Verdana" size="1" color="#000000">',$er_msg,'</font></td>';
+print MailFile '</tr>';
+}
+print MainFile '</table>';
+}
+
+	print MainFile <<MAINBOTTOM;
+	</table>
+</td></tr>
+</table>
+
+MAINBOTTOM
+
+	
+	
+	print MainFile <<MAINLAST;
+</body></html>
+
+MAINLAST
+
+	close(MainFile);
+}
+
+sub create_alarms
+{
+	open(AlarmFile, ">$root/alarms.html") 
+			|| do_error_page(["Can't open alarms.html for writing at $root"]);
+			
+	print AlarmFile<<ALARMTOP;
+	<table border="0" width="100%" bgcolor="#ffffff" cellpadding="0" cellspacing="1">
+			
+ALARMTOP
+	
+	my $bgcolor="#eeffee";
+	my $count = 1;
+	
+	foreach my $alarm (@{$results{'alarms_since_restart'}})
+	{
+		print AlarmFile '<td bgcolor="', "#cccccc", '" valign="top"><font face="Verdana" size="1" color="#000000">';
+		print AlarmFile "$count";
+		print AlarmFile '</font></td>';
+		
+		print AlarmFile '<td bgcolor="', $bgcolor, '" valign="top"><font face="Verdana" size="1" color="#000000">';
+		print AlarmFile "$alarm";
+		print AlarmFile '</font></td></tr>';
+		if ($bgcolor eq "#eeffee")
+		{$bgcolor = "#ccffcc";}
+		else {$bgcolor = "#eeffee";}
+		$count++;
+			
+	}
+	
+	print AlarmFile '</table>';
+	close(AlarmFile);
+
+}
+
+sub create_errors
+{
+	open(ErrorFile, ">$root/errors.html") 
+			|| do_error_page(["Can't open errors.html for writing at $root"]);
+			
+	print ErrorFile<<ERRORTOP;
+	<table border="0" width="100%" bgcolor="#ffffff" cellpadding="0" cellspacing="1">
+			
+ERRORTOP
+	
+	my $bgcolor="#eeffee";
+	my $count = 1;
+	
+	foreach my $err (@{$results{'errors_since_restart'}})
+	{
+		print ErrorFile '<td bgcolor="', "#cccccc", '" valign="top"><font face="Verdana" size="1" color="#000000">';
+		print ErrorFile "$count";
+		print ErrorFile '</font></td>';
+		
+		print ErrorFile '<td bgcolor="', $bgcolor, '" valign="top"><font face="Verdana" size="1" color="#000000">';
+		print ErrorFile "$err";
+		print ErrorFile '</font></td></tr>';
+		if ($bgcolor eq "#eeffee")
+		{$bgcolor = "#ccffcc";}
+		else {$bgcolor = "#eeffee";}
+		$count++;
+			
+	}
+	
+	print ErrorFile '</table>';
+	close(ErrorFile);
+
+}
+
+
+sub create_logentries
+{
+	open(LogFile, ">$root/logentries.html") 
+			|| do_error_page(["Can't open logentries.html for writing at $root"]);
+			
+	print LogFile<<LOGTOP;
+	<table border="0" width="100%" bgcolor="#ffffff" cellpadding="0" cellspacing="1">
+			
+LOGTOP
+	
+	my $bgcolor="#eeffee";
+	my $count = 1;
+	
+	foreach my $err (@{$results{'log'}})
+	{
+		print LogFile '<td bgcolor="', "#cccccc", '" valign="top"><font face="Verdana" size="1" color="#000000">';
+		print LogFile "$count";
+		print LogFile '</font></td>';
+		
+		print LogFile '<td bgcolor="', $bgcolor, '" valign="top"><font face="Verdana" size="1" color="#000000">';
+		print LogFile "$err";
+		print LogFile '</font></td></tr>';
+		if ($bgcolor eq "#eeffee")
+		{$bgcolor = "#ccffcc";}
+		else {$bgcolor = "#eeffee";}
+		$count++;
+			
+	}
+	
+	print LogFile '</table>';
+	close(LogFile);
+
+}
+
+sub create_logpage
+{
+	
+	open(LogPageFile, ">$root/log.html") 
+			|| do_error_page(["Can't open log.html for writing at $root"]);
+	
+	my $errors_in_file = "no";
+	my $error_colour="#00cc00";
+	
+	if ($results{'has_errors'}) {$errors_in_file = "yes"; $error_colour="#cc0000";}  
+	
+	my $state = $results{'state'};
+	my $state_colour="#00cc00";
+	
+	$state_colour="#cc0000" if ($state eq "stopped");
+	$state_colour="#cccc00" if ($state eq "paused");
+	
+	print LogPageFile<<LOGPAGETOP;
+	<html><head><title>serverM installation report</title>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" />
+<meta http-equiv="Content-Language" content="en" />
+<meta name="Description" content="" />
+<meta name="Keywords" content="serverM installation report" />
+<STYLE>
+<!--
+A{text-decoration:none}
+-->
+</STYLE>
+</head>
+<body bgcolor="#66cc66" leftmargin="0" topmargin="0" marginwidth="0" marginheight="0" alink="#339933" vlink="#339933" link="#339933">
+<p align="right">
+<table border="1" width="95%" bgcolor="#ffffff" cellpadding="10" cellspacing="0" height="100%">
+<tr>
+<td valign="top" bgcolor="#ffffff">
+<table cellpadding="2" cellspacing="2" width="100%">
+				<tr>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="1" color="#00cc00"><b>></b></font><a href="main.html"><font face="Verdana" size="1" color="#ffffff">Home</a></font></td>
+					<td align="left" bgcolor="#666666" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="log.html"><font face="Verdana" size="1" color="#ffffff">Log File Analysis</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="rules.html"><font face="Verdana" size="1" color="#ffffff">Rules Analysis</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="config.html"><font face="Verdana" size="1" color="#ffffff">Configuration</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="http://www.port80.com/serverM/index.html"><font face="Verdana" size="1" color="#ffffff">serverM website</font></a></td>
+				</tr>
+				</table>
+	<table border="0" width="100%" bgcolor="#ffffff" cellpadding="0" cellspacing="0">
+		<tr>
+			<td bgcolor="#ffffff" valign="top"><font face="Verdana" size="2" color="#000000"><p><br><strong>serverM system log report<p><font face="Verdana" size="1" color="#000000">
+			Server: $machine<br>
+			Date page created: $nowDate<br>
+			Current state: <font face="Verdana" size="1" color="$state_colour">$state&nbsp; (unless archived log)</font><br>
+			<font face="Verdana" size="1" color="#000000">Log line limit: $limit</font></td>
+			<td align="right">
+			<table border="0" cellspacing="0" cellpadding="1"><tr><td><p><br><img src="report.gif" hspace="50"></td></tr><tr><td align="center"><font face="Verdana" size="1" color="#999999">Protected by</font></td></tr>
+			<tr><td align="center"><font face="Verdana" size="1" color="#999999">serverM</font></td></tr></table></td>
+		</tr>
+		<tr>
+			<td valign="top"><p><br></td>
+		</tr>
+		<tr>
+			<td bgcolor="#eeffee" valign="top" width="30%"><font face="Verdana" size="1" color="#000000">First entry:</font></td>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="#000000">$results{'first_entry'}</font></td>
+		</tr>
+		<tr>
+			<td bgcolor="#ccffcc" valign="top"><font face="Verdana" size="1" color="#000000">Last entry:</font></td>
+			<td bgcolor="#ccffcc" valign="top"><font face="Verdana" size="1" color="#000000">$results{'last_entry'}</font></td>
+		</tr>
+		<tr>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="#000000">Most recent startup time:</font></td>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="#000000">$results{'last_startup_time'}</font></td>
+		</tr>
+		<tr>
+			<td bgcolor="#ccffcc" valign="top"><font face="Verdana" size="1" color="#000000">Most recent stopped time:</font></td>
+			<td bgcolor="#ccffcc" valign="top"><font face="Verdana" size="1" color="#000000">$results{'last_stop_time'}</font></td>
+		</tr>
+		<tr>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="#000000">Most recent pause time:</font></td>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="#000000">$results{'last_pause_time'}</font></td>
+		</tr>
+		<tr>
+			<td bgcolor="#ccffcc" valign="top"><font face="Verdana" size="1" color="#000000">Most recent continue time:</font></td>
+			<td bgcolor="#ccffcc" valign="top"><font face="Verdana" size="1" color="#000000">$results{'last_cont_time'}</font></td>
+		</tr>
+		<tr>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="#000000">Most recent alarm time:</font></td>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="#000000">$results{'last_alarm_time'}</font></td>
+		</tr>
+		<tr>
+			<td bgcolor="#ccffcc" valign="top"><font face="Verdana" size="1" color="#000000">Most recent error time:</font></td>
+			<td bgcolor="#ccffcc" valign="top"><font face="Verdana" size="1" color="#000000">$results{'last_error_time'}</font></td>
+		</tr>
+		<tr>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="#000000">Currently errors in rules file:</font></td>
+			<td bgcolor="#eeffee" valign="top"><font face="Verdana" size="1" color="$error_colour">$errors_in_file</font></td>
+		</tr>
+		<tr>
+			<td valign="top"><p><br></td>
+		</tr>
+		<tr>
+			<td colspan="2">
+			<p align="left">
+			<font face="Verdana" size="1" color="#000000"><strong>Last $limit lines of log file<strong></font><br>
+				<IFRAME SRC="logentries.html" TITLE="current log alarms" width="100%" border="0" scrolling="yes">
+				<!-- Alternate content for non-supporting browsers -->
+				<font face="Verdana" size="1" color="#000000">Your browser does not support this HTML...</font>
+				...
+				</IFRAME>
+			</td>
+		</tr>
+		<tr>
+			<td valign="top"><p><br></td>
+		</tr>
+		<tr>
+			<td colspan="2">
+			<p align="left">
+			<font face="Verdana" size="1" color="#000000"><strong>Recent Alarms<strong></font><br>
+				<IFRAME SRC="alarms.html" TITLE="current log alarms" width="100%" border="0" scrolling="yes">
+				<!-- Alternate content for non-supporting browsers -->
+				<font face="Verdana" size="1" color="#000000">Your browser does not support this HTML...</font>
+				...
+				</IFRAME>
+			</td>
+		</tr>
+		<tr>
+			<td valign="top"><p><br></td>
+		</tr>
+		<tr>
+			<td colspan="2">
+			<p align="left">
+			<font face="Verdana" size="1" color="#000000"><strong>Recent Error Messages<strong></font><br>
+				<IFRAME SRC="errors.html" TITLE="current log alarms" width="100%" border="0" scrolling="yes">
+				<!-- Alternate content for non-supporting browsers -->
+				<font face="Verdana" size="1" color="#000000">Your browser does not support this HTML...</font>
+				...
+				</IFRAME>
+			</td>
+		</tr>
+	</table>
+</td></tr>
+</table>
+</body></html>
+
+LOGPAGETOP
+
+	close(LogPageFile);
+}
+
+sub create_rules
+{
+	open(RuleFile, ">$root/rules.html") 
+			|| do_error_page(["Can't open rules.html for writing at $root"]);
+			
+	print RuleFile<<RULETOP;
+<html><head>
+<title>serverM installation report</title>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" />
+<meta http-equiv="Content-Language" content="en" />
+<meta name="Description" content="" />
+<meta name="Keywords" content="serverM installation report" />
+<STYLE>
+<!--
+A{text-decoration:none}
+-->
+</STYLE>
+</head>
+<body bgcolor="#66cc66" leftmargin="0" topmargin="0" marginwidth="0" marginheight="0" alink="#339933" vlink="#339933" link="#339933">
+<p align="right">
+<table border="1" width="95%" bgcolor="#ffffff" cellpadding="10" cellspacing="0" height="100%">
+<tr>
+<td valign="top" bgcolor="#ffffff">
+<table cellpadding="2" cellspacing="2" width="100%">
+				<tr>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="1" color="#00cc00"><b>></b></font><a href="main.html"><font face="Verdana" size="1" color="#ffffff">Home</a></font></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="log.html"><font face="Verdana" size="1" color="#ffffff">Log File Analysis</font></a></td>
+					<td align="left" bgcolor="#666666" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="rules.html"><font face="Verdana" size="1" color="#ffffff">Rules Analysis</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="config.html"><font face="Verdana" size="1" color="#ffffff">Configuration</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="http://www.port80.com/serverM/index.html"><font face="Verdana" size="1" color="#ffffff">serverM website</font></a></td>
+				</tr>
+				</table>
+				
+<table border="0" width="100%" bgcolor="#ffffff" cellpadding="0" cellspacing="0">
+		<tr>
+			<td bgcolor="#ffffff" valign="top">
+			
+			<font face="Verdana" size="2" color="#000000"><p><br><strong>serverM system rule parsing report<p><font face="Verdana" size="1" color="#000000">
+			Server: $machine<br>
+			Date page created: $nowDate<br></font></td>
+			<td align="right">
+			<table border="0" cellspacing="0" cellpadding="1"><tr><td><p><br><img src="report.gif" hspace="50"></td></tr><tr><td align="center"><font face="Verdana" size="1" color="#999999">Protected by</font></td></tr>
+			<tr><td align="center"><font face="Verdana" size="1" color="#999999">serverM</font></td></tr></table></td>
+		</tr>
+
+		</table>
+						
+RULETOP
+
+
+print RuleFile '<a name="top">';
+
+print RuleFile '<font face="Verdana" size="1" color="#000000"><strong>Rules parsed successfully (in order of evaluation)</strong></font><br>';
+print RuleFile '<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+';
+
+my $bgcolor="#eeffee";
+	my $count = 1;
+my $pfile="";
+my $name="";
+
+if (@$rfLocalOrder == ())
+{
+	print RuleFile '<tr><td bgcolor="',$bgcolor, '" valign="top" colspan="2"><font face="Verdana" size="1" color="#000000">No rules parsed successfully</font></td></tr>';
+	
+}
+else
+{
+	foreach my $rule (@$rfLocalOrder)
+	{
+		print RuleFile '<tr><td bgcolor="',$bgcolor, '" valign="top" ><font face="Verdana" size="1" color="#000000">';
+		$rule =~ m/(\S*)\s*(.*)/;
+		$pfile = $1; $name=$2;
+		print RuleFile '<a href="#', $rule, '">';
+		print RuleFile "$name", '</a>';
+		print RuleFile '</font></td>';
+		print RuleFile '<td bgcolor="',$bgcolor, '" valign="top" width="30%" align="right"><font face="Verdana" size="1" color="#000000">File: ';	
+		$pfile = "rules.txt" if ($pfile eq "rules");
+		print RuleFile "$pfile";
+		print RuleFile '</font></td></tr>';
+		
+		if ($bgcolor eq "#eeffee")
+			{$bgcolor = "#ccffcc";}
+			else {$bgcolor = "#eeffee";}
+			$count++;
+	}
+}
+print RuleFile '</table></td></tr></table>';
+
+print RuleFile "<b><p><b>";
+	
+print RuleFile '<font face="Verdana" size="1" color="#cc0000" ><strong>Rules parsed unsuccessfully</strong></font><br>';
+print RuleFile '<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+';
+
+my $bgcolor="#eeffee";
+	my $count = 1;
+my $pfile="";
+my $name="";
+
+my @errs = keys %$rfErrorReport;
+if (@errs == 0)
+{
+	print RuleFile '<tr><td bgcolor="',$bgcolor, '" valign="top"  colspan="3"><font face="Verdana" size="1" color="#000000">No rules parsed unsuccessfully</font></td></tr>';
+	
+}
+else
+{
+	foreach my $rule (keys %$rfErrorReport)
+	{
+		print RuleFile '<tr><td bgcolor="',$bgcolor, '" valign="top" ><font face="Verdana" size="1" color="#000000">';
+		$rule =~ m/(\S*)\s*(.*)/;
+		$pfile = $1; $name=$2;
+	
+		print RuleFile "$name";
+		print RuleFile '</font></td>';
+		print RuleFile '<td bgcolor="',$bgcolor, '" valign="top" align="left"><font face="Verdana" size="1" color="#000000">File: ';	
+		$pfile = "rules.txt" if ($pfile eq "rules");
+		print RuleFile "$pfile";
+		print RuleFile '</font></td>';
+		print RuleFile '<td bgcolor="',$bgcolor, '" valign="top" align="left"><font face="Verdana" size="1" color="#000000">Error message: ';
+		print RuleFile $rfErrorReport->{$rule};
+		print RuleFile '</font></td>';
+		print RuleFile '</tr>';
+		
+		if ($bgcolor eq "#eeffee")
+			{$bgcolor = "#ccffcc";}
+			else {$bgcolor = "#eeffee";}
+			$count++;
+	}
+}
+
+print RuleFile '</table></td></tr></table>';
+
+print RuleFile "<b><p><b>";
+	
+print RuleFile '<font face="Verdana" size="1" color="#cc0000" ><strong>All Errors in Rules Files</strong></font><br>';
+print RuleFile '<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+';
+
+my $bgcolor="#eeffee";
+	my $count = 1;
+my $pfile="";
+my $name="";
+
+my @errs = @$rfErrors;
+if (@errs == 0)
+{
+	print RuleFile '<tr><td bgcolor="',$bgcolor, '" valign="top"><font face="Verdana" size="1" color="#000000">No Errors in Rules Files</font></td></tr>';
+	
+}
+else
+{
+	foreach my $er (@errs)
+	{
+		print RuleFile '<tr><td bgcolor="',$bgcolor, '" valign="top" ><font face="Verdana" size="1" color="#000000">';
+		
+	
+		print RuleFile "$er";
+		print RuleFile '</font></td>';
+		print RuleFile '</tr>';
+		
+		if ($bgcolor eq "#eeffee")
+			{$bgcolor = "#ccffcc";}
+			else {$bgcolor = "#eeffee";}
+			$count++;
+	}
+}
+
+print RuleFile '</table></td></tr></table>';
+
+print RuleFile "<b><p><b>";
+
+print RuleFile '<font face="Verdana" size="1" color="#000000"><strong>Global ignores</strong></font><br>';
+print RuleFile '<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+';
+
+my $bgcolor="#eeffee";
+	my $count = 1;
+
+my @filechange =  @{$rfGlobal_ignores->{'filechange'}};
+my @filesize =  @{$rfGlobal_ignores->{'filesize'}};
+
+
+if (
+		(@filechange==()) && (@filesize==()))
+{
+	print RuleFile '<tr><td bgcolor="#cccccc" valign="top" colspan="2"><font face="Verdana" size="1" color="#000000">No global ignores</font></td>';
+	
+	print RuleFile '</tr>';
+	
+}
+else
+{
+	print RuleFile '<tr><td bgcolor="#cccccc" valign="top" width="30%"><font face="Verdana" size="1" color="#000000"><strong>Type</font></td>';
+	print RuleFile '<td bgcolor="#cccccc" valign="top" width="30%"><font face="Verdana" size="1" color="#000000"><strong>Definition</font></td>';
+	print RuleFile '</tr>';
+	
+	
+	foreach my $def (@filechange)
+	{
+		print RuleFile '<tr><td bgcolor="',$bgcolor, '" valign="top" width="30%"><font face="Verdana" size="1" color="#000000">';
+		print RuleFile "filechange";
+		print RuleFile '</font></td>';
+		print RuleFile '<td bgcolor="',$bgcolor, '" valign="top" width="30%" align="right"><font face="Verdana" size="1" color="#000000">';	
+		
+		print RuleFile "$def";
+		print RuleFile '</font></td></tr>';
+		
+		if ($bgcolor eq "#eeffee")
+			{$bgcolor = "#ccffcc";}
+			else {$bgcolor = "#eeffee";}
+			$count++;
+	}
+	foreach my $def (@filesize)
+	{
+		print RuleFile '<tr><td bgcolor="',$bgcolor, '" valign="top" width="30%"><font face="Verdana" size="1" color="#000000">';
+		print RuleFile "filesize";
+		print RuleFile '</font></td>';
+		print RuleFile '<td bgcolor="',$bgcolor, '" valign="top" width="30%" align="right"><font face="Verdana" size="1" color="#000000">';	
+		
+		print RuleFile "$def";
+		print RuleFile '</font></td></tr>';
+		
+		if ($bgcolor eq "#eeffee")
+			{$bgcolor = "#ccffcc";}
+			else {$bgcolor = "#eeffee";}
+			$count++;
+	}
+	
+}
+print RuleFile '</table></td></tr></table>';
+
+print RuleFile "<b><p><b>";
+
+# now for the complex part - the rules display!
+#$LocalrfValues,
+# $LocalrfOnceOnly,
+#  $LocalrfOnceUntilFail,
+#   $rfLocalOrder, 
+#   $rfLocalIfAndConditions, 
+#   $rfLocalIfOrConditions, 
+#   $rfLocalEvery, 
+#   $rfRules_files, 
+#   $rfGlobal_ignores, 
+#   $rfErrorReport
+
+# start by pre-defining a more usable hash of values
+
+my %prules = ();
+my @rule_names = keys (%{$LocalrfValues->{type}});
+my %types = %{$LocalrfValues->{type}};
+my %values = %{$LocalrfValues->{value}};
+my %constraints = %{$LocalrfValues->{constraints}};
+my %alarms = %{$LocalrfValues->{alarm}};
+my %ignores = %{$LocalrfValues->{ignores}};
+my %severity = %{$LocalrfValues->{severity}};
+
+my %scopes=();
+my %files=();
+my %short_name = ();
+my %pragmas = ();
+my %display = ();
+my %gignores = ();
+my %lignores = ();
+
+foreach my $rule (@$rfLocalOrder)
+{
+	
+	$rule =~ m/(\S*)\s*(.*)/;
+	my $pfile = $1; 
+	my $name=$2; 
+	my $scope="N/A";
+	my $short_name = $name;
+	if ($name =~ /\s*\{([^\}]+)\}\s*(.*)/)
+	{ $scope = $1; $short_name = $2;}
+	$scopes{$rule} = $scope;
+	
+	if ($pfile eq "rules")
+	{
+		$pfile = "$path/rules.txt";
+	}
+	else
+	{
+		$pfile = "$path/$pfile";
+	}
+	
+	$files{$rule} = $pfile;
+	$files{$rule} =~ s/\//\\/g;
+	$short_name{$rule} = $short_name;
+	# print RuleFile "<br>Name: $rule, short name: $short_name, file:$file, scope:$scope";
+	$pragmas{$rule} = [];
+	
+	if ($rfLocalEvery->{$rule})
+	{ push @{$pragmas{$rule}}, "[every $rfLocalEvery->{$rule}]";}
+	
+	if ($rfLocalCycle->{$rule})
+	{ push @{$pragmas{$rule}}, "[on-cycle $rfLocalCycle->{$rule}]";}
+	
+	if ($rfLocalInitial->{$rule})
+	{ push @{$pragmas{$rule}}, "[initial]";}
+	
+	if (($severity{$rule}) && ($severity{$rule}>0))
+	{ push @{$pragmas{$rule}}, "[severity $severity{$rule}]";}
+	
+	if ($rfLocalIfAndConditions->{$rule})
+	{ 
+			my $rule_list = join(" ", @{$rfLocalIfAndConditions->{$rule}});
+			push @{$pragmas{$rule}}, "[if-and $rule_list]";
+			
+	}
+	
+	if ($rfThrottle->{$rule})
+	{ 
+			my $rule_list = $rfThrottle->{$rule};
+			my $to_print = "";
+			if ($rule_list < 60)
+			{
+				$to_print = "$rule_list seconds";
+			}
+			if (($rule_list < 3600) && ($rule_list > 59))
+			{
+				$to_print = $rule_list / 60;
+				$to_print = "$to_print minutes";
+			}
+			if (($rule_list > 3599) && ($rule_list < 86400))
+			{
+				$to_print = $rule_list / 3600;
+				$to_print = "$to_print hours";
+			}
+			if ($rule_list>86399)
+			{
+				$to_print = $rule_list / 86400;
+				$to_print = "$to_print days";
+			}
+			push @{$pragmas{$rule}}, "[throttle $to_print]";
+			
+	}
+	
+	if ($rfLocalIfOrConditions->{$rule})
+	{ 
+			my $rule_list = join(", ", @{$rfLocalIfOrConditions->{$rule}});
+			push @{$pragmas{$rule}}, "[if-or $rule_list]";
+			
+	}
+	
+	if ($LocalrfOnceOnly->{$rule})
+	{push @{$pragmas{$rule}}, "[once only]";}
+		
+	if ($LocalrfOnceUntilFail->{$rule})
+	{push @{$pragmas{$rule}}, "[once until fail]";}
+	
+	if ($rfAttime->{$rule})
+	{
+		my @times = @{$rfAttime->{$rule}};
+		my @processed_times = ();
+		foreach my $ntime (@times)
+		{
+			my ($start_time, $end_time) = split(/:/, $ntime);
+			$start_time = convert24($start_time);
+			$end_time = convert24($end_time);
+			push @processed_times, "$start_time:$end_time";
+		}
+		my $times = join(", ", @processed_times);
+		push @{$pragmas{$rule}}, "[at-time $times]";
+	}
+	
+	if ($rfOnday->{$rule})
+	{
+		my $days = join(", ", @{$rfOnday->{$rule}});
+		push @{$pragmas{$rule}}, "[on-day $days]";
+	}
+	
+	#print RuleFile "Pragmas for rule $rule are: ", join("\n", @{$pragmas{$rule}}), "<br>";
+	
+	my $gignores="";
+	$gignores .= "<br>&nbsp;&nbsp;filechange:" . join("<br>&nbsp;&nbsp;filechange:", @filechange) if ((@filechange != ()) && ($types{$rule} eq "file change"));
+	$gignores .= "<br>&nbsp;&nbsp;filesize:" . join("<br>&nbsp;&nbsp;filesize:", @filesize) if ((@filesize != ()) && ($types{$rule} eq "file size"));
+	
+	$gignores =~ s/^<br>//;
+	
+	$gignores="&nbsp;&nbsp;none applicable" if ($gignores eq "");
+	$gignores{$rule} = $gignores;
+	
+	my $lignores="";
+	if (($types{$rule} eq "file change") && (@{$ignores{$rule}->{'filechange'}} != ()))
+	{$lignores .= "<br>&nbsp;&nbsp;filechange:" . join("<br>&nbsp;&nbsp;filechange:", @{$ignores{$rule}->{'filechange'}}) ; }
+	
+	if ( ($types{$rule} eq "file size") && (@{$ignores{$rule}->{'filesize'}} != ()))
+	{$lignores .= "<br>&nbsp;&nbsp;filesize:" . join("<br>&nbsp;&nbsp;filesize:", @{$ignores{$rule}->{'filesize'}}) ; }
+	
+	$lignores =~ s/^<br>//;
+	
+	$lignores="&nbsp;&nbsp;none applicable" if ($lignores eq "");
+	$lignores{$rule} = $lignores;
+	
+	$display{$rule} = "";
+	
+	if ($types{$rule} eq "status")
+	{
+		$display{$rule} = "status = $values{$rule}::-<br>&nbsp;&nbsp;";
+		my $constraints="";
+		$display{$rule} .=$constraints{$rule};
+	}
+	
+	
+		if ($types{$rule} eq "file change")
+		{
+			$display{$rule} = "filechange -> $values{$rule}::-<br>&nbsp;&nbsp;$constraints{$rule}";
+			$display{$rule} =~ s/\//\\/g;
+		}
+		
+		if ($types{$rule} eq "users")
+		{
+			$display{$rule} = "$values{$rule}::-<br>&nbsp;&nbsp;$constraints{$rule}";
+			$display{$rule} =~ s/\//\\/g;
+		}
+		
+		if ($types{$rule} eq "file size")
+		{
+			$display{$rule} = "filesize -> $values{$rule}::-<br>&nbsp;&nbsp;$constraints{$rule}";
+			$display{$rule} =~ s/\//\\/g;
+		}
+		
+		if ($types{$rule} eq "new service")
+		{
+			$display{$rule} = "new service::-<br>&nbsp;&nbsp;$constraints{$rule}";
+		}
+		
+		if ($types{$rule} eq "true")
+		{
+			$display{$rule} = "true::-<br>&nbsp;&nbsp; none";
+		}
+	
+
+}
+	
+foreach my $rule (@$rfLocalOrder)
+{
+
+my $pragmas="";
+if (@{$pragmas{$rule}} != [])
+{$pragmas = "&nbsp;&nbsp;" . join("<br>&nbsp;&nbsp;", @{$pragmas{$rule}});}
+else
+{$pragmas = "none";}
+
+my $alarms="";
+$alarms .= "&nbsp;&nbsp;email:" . join("<br>&nbsp;&nbsp;email:", @{$alarms{$rule}->{'email'}}) if (@{$alarms{$rule}->{'email'}} != ());
+$alarms .= "<br>&nbsp;&nbsp;SMS:" . join("<br>&nbsp;&nbsp;SMS:", @{$alarms{$rule}->{'sms'}}) if (@{$alarms{$rule}->{'sms'}} != ());
+$alarms .= "<br>&nbsp;&nbsp;execute:" . join("<br>&nbsp;&nbsp;execute:", @{$alarms{$rule}->{'execute'}}) if (@{$alarms{$rule}->{'execute'}} != ());
+
+$alarms =~ s/\//\\/g;
+$alarms = "none" if ($alarms eq "");
+
+print RuleFile "<b><p><b>";
+print RuleFile '<a name="', $rule, '">';
+
+print RuleFile<<RULES;
+<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+	<tr>
+		<td bgcolor="#cccccc" width="10%"><font face="Verdana" size="1" color="#000000"><strong>Name:</strong></font></td>
+		<td bgcolor="#ffffff" width="35%" valign="top"><font face="Verdana" size="1" color="#00cc00">$short_name{$rule}</font></td>
+		<td bgcolor="#cccccc" width="10%" valign="top"><font face="Verdana" size="1" color="#000000"><strong>File:</strong></font></td>
+		<td bgcolor="#ffffff" width="20%" valign="top"><font face="Verdana" size="1" color="#000000">$files{$rule}</font></td>
+		<td bgcolor="#cc9999" width="10%" valign="top"><font face="Verdana" size="1" color="#000000"><strong>Scope:</strong></font></td>
+		<td bgcolor="#ffffff" width="15%" valign="top"><font face="Verdana" size="1" color="#000000">$scopes{$rule}</font></td>
+	</tr>
+	</table>
+	</td>
+</tr>
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+	<tr>
+		<td bgcolor="#cccccc" align="left" width="10%" valign="top"><font face="Verdana" size="1" color="#000000"><strong>Definition</strong></font></td>
+		<td bgcolor="#ffffff" align="left" valign="top"><font face="Verdana" size="1" color="#000000">
+		$display{$rule}
+		</font></td>
+	</tr>
+	</table>
+	</td>
+</tr>
+
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+	<tr>
+		<td bgcolor="#cccccc" align="left" width="10%" valign="top"><font face="Verdana" size="1" color="#000000"><strong>Alarms</strong></font></td>
+		<td bgcolor="#ffffff" align="left" valign="top"><font face="Verdana" size="1" color="#000000">
+		$alarms</font></td>
+	</tr>
+	</table>
+	</td>
+</tr>
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+	<tr>
+		<td bgcolor="#cccccc" align="left" width="10%" valign="top"><font face="Verdana" size="1" color="#000000"><strong>Pragmas</strong></font></td>
+		<td bgcolor="#ffffff" align="left" valign="top"><font face="Verdana" size="1" color="#000000">
+		$pragmas</font></td>
+	</tr>
+	</table>
+	</td>
+</tr>
+
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+	<tr>
+		<td bgcolor="#cccccc" align="left" width="10%" valign="top"><font face="Verdana" size="1" color="#000000"><strong>Ignores in global scope</strong></font></td>
+		<td bgcolor="#ffffff" align="left" valign="top"><font face="Verdana" size="1" color="#000000">
+		$gignores{$rule}</font></td>
+	</tr>
+	</table>
+	</td>
+</tr>
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+	<tr>
+		<td bgcolor="#cccccc" align="left" width="10%" valign="top"><font face="Verdana" size="1" color="#000000"><strong>Ignores in local scope</strong></font></td>
+		<td bgcolor="#ffffff" align="left" valign="top"><font face="Verdana" size="1" color="#000000">
+		$lignores{$rule}</font></td>
+	</tr>
+	</table>
+	</td>
+</tr>
+
+</table>
+
+RULES
+print RuleFile '<br><font face="Verdana" size="1" color="#000000"><a href="#top">^ back to top</a></font>';
+
+}
+print RuleFile '</td></tr></table></body></html>';
+
+}
+
+sub convert24 {
+	my $reptime = shift;
+	my $time_24;
+	
+	my $hourStart = ($reptime - ($reptime % 60)) / 60;
+	my $minStart = $reptime - $hourStart * 60;
+	$minStart = "0$minStart" if ($minStart < 10);
+	$hourStart = "0$hourStart" if ($hourStart < 10);
+	$time_24 ="$hourStart$minStart";
+	
+	return $time_24;
+}
+
+sub create_config {
+	open(ConfigFile, ">$root/config.html") 
+			|| do_error_page(["Can't open config.html for writing at $root"]);
+			
+	print ConfigFile<<CONFIGTOP;
+<html><head>
+<title>serverM installation report</title>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" />
+<meta http-equiv="Content-Language" content="en" />
+<meta name="Description" content="" />
+<meta name="Keywords" content="serverM installation report" />
+<STYLE>
+<!--
+A{text-decoration:none}
+-->
+</STYLE>
+</head>
+<body bgcolor="#66cc66" leftmargin="0" topmargin="0" marginwidth="0" marginheight="0" alink="#339933" vlink="#339933" link="#339933">
+<p align="right">
+<table border="1" width="95%" bgcolor="#ffffff" cellpadding="10" cellspacing="0" height="100%">
+<tr>
+<td valign="top" bgcolor="#ffffff">
+<table cellpadding="2" cellspacing="2" width="100%">
+				<tr>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="1" color="#00cc00"><b>></b></font><a href="main.html"><font face="Verdana" size="1" color="#ffffff">Home</a></font></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="log.html"><font face="Verdana" size="1" color="#ffffff">Log File Analysis</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="rules.html"><font face="Verdana" size="1" color="#ffffff">Rules Analysis</font></a></td>
+					<td align="left" bgcolor="#666666" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="config.html"><font face="Verdana" size="1" color="#ffffff">Configuration</font></a></td>
+					<td align="left" bgcolor="#000000" width="20%"><font face="Verdana" size="2" color="#00cc00">></font> <a href="http://www.port80.com/serverM/index.html"><font face="Verdana" size="1" color="#ffffff">serverM website</font></a></td>
+				</tr>
+				</table>
+				
+<table border="0" width="100%" bgcolor="#ffffff" cellpadding="0" cellspacing="0">
+		<tr>
+			<td bgcolor="#ffffff" valign="top">
+			
+			<font face="Verdana" size="2" color="#000000"><p><br><strong>serverM system configuration file report<p><font face="Verdana" size="1" color="#000000">
+			Server: $machine<br>
+			Date page created: $nowDate<br></font></td>
+			<td align="right">
+			<table border="0" cellspacing="0" cellpadding="1"><tr><td><p><br><img src="report.gif" hspace="50"></td></tr><tr><td align="center"><font face="Verdana" size="1" color="#999999">Protected by</font></td></tr>
+			<tr><td align="center"><font face="Verdana" size="1" color="#999999">serverM</font></td></tr></table></td>
+		</tr>
+
+		</table>
+						
+CONFIGTOP
+
+print ConfigFile '<font face="Verdana" size="1" color="#cc0000"><strong>Config file errors</strong></font><br>';
+print ConfigFile '<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+';
+
+my $bgcolor="#eeffee";
+my $count = 1;
+
+
+if ($er_result)
+{
+	print ConfigFile '<tr><td bgcolor="',$bgcolor, '" valign="top" colspan="2"><font face="Verdana" size="1" color="#000000">No configuration errors</font></td></tr>';
+	
+}
+else
+{
+	foreach my $err (@$rfErrorList)
+	{
+		print ConfigFile '<tr><td bgcolor="',$bgcolor, '" valign="top" ><font face="Verdana" size="1" color="#000000">';
+		
+		print ConfigFile "$err";
+		print ConfigFile '</font></td>';
+		print ConfigFile '</tr>';
+		
+		if ($bgcolor eq "#eeffee")
+			{$bgcolor = "#ccffcc";}
+			else {$bgcolor = "#eeffee";}
+			$count++;
+	}
+	print ConfigFile '<tr><td bgcolor="',$bgcolor, '" valign="top" colspan="2"><font face="Verdana" size="1" color="#000000"><strong>Note: configuration errors may result in unexpected behaviour</strong></font></td></tr>';
+}
+print ConfigFile '</table></td></tr></table>';
+
+print ConfigFile '<br><p><br>';
+
+print ConfigFile '<font face="Verdana" size="1" color="#000000"><strong>Config parameters</strong></font><br>';
+print ConfigFile '<table border="1" cellpadding="2" cellspacing="0" width="100%">
+<tr>
+	<td valign="top" bgcolor="#ffffff">
+	<table border="0" cellpadding="2" cellspacing="0" width="100%">
+';
+
+my $bgcolor="#eeffee";
+my $count = 1;
+
+
+my %params = %$LocalrfValStruct;
+my @sorted_params = sort { $b cmp $a } keys %params;
+	while (@sorted_params)
+	{
+		my $param_key = pop @sorted_params;
+		print ConfigFile '<tr><td bgcolor="',$bgcolor, '" valign="top"  width="25%"><font face="Verdana" size="1" color="#000000">';
+		
+		print ConfigFile "$param_key";
+		print ConfigFile '</font></td>';
+
+		if ($param_key =~ /user-def/)
+		{
+			my %user_values = %{$params{$param_key}};
+			$params{$param_key}=join(',', keys %user_values);
+		}
+		
+		if ($param_key eq "rlog")
+		{
+			my ($ip, $port, $key) = split(/\,/, $params{$param_key});
+			if ($key)
+			{ $params{$param_key}="$ip, UDP port=$port, [key - hidden]"; }
+			else
+			{ $params{$param_key}="$ip, UDP port=$port, [no key]"; }
+		}
+
+		if ($param_key =~ /daily-report-time/i)
+		{
+			$params{$param_key} = convert24($params{$param_key});
+		}
+		
+		if ($param_key =~ /daily-report-emails/i)
+		{
+			my $ecount = 1;
+			my $new_val = "";
+			foreach my $em (@{$params{$param_key}})
+			{
+				if ($em ne "none")
+				{	$new_val .= "email $ecount: $em<br>";
+					$ecount++;
+				}
+			}
+			$new_val =~ s/\<br\>$//;
+			$params{$param_key} = $new_val;
+		}
+				
+			
+		print ConfigFile '<td bgcolor="',$bgcolor, '" valign="top" align="left"><font face="Verdana" size="1" color="#000000">';
+		print ConfigFile $params{$param_key};
+		print ConfigFile '</font></td>';
+		print ConfigFile '</tr>';
+		
+		if ($bgcolor eq "#eeffee")
+			{$bgcolor = "#ccffcc";}
+			else {$bgcolor = "#eeffee";}
+			$count++;
+	}
+
+print ConfigFile '</table></td></tr></table>';
+
+print ConfigFile '</td></tr></table></body></html>';
+}
+
+sub read_service
+{
+	 my $current_status = "running"	; my $warn_colour='#00cc00';
+	
+			
+	return ($current_status, $warn_colour);
+	
+}

@@ -1,0 +1,572 @@
+#!/usr/bin/perl -I lib
+
+# the serverM automated configuration script V 1.0
+# D. Scholefield 2004, 2005, 2006 (www.port80.com)
+# Version 2.80 (Linux/Mac OS X/BSD)
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+use strict;
+use Data::Dumper;
+
+my %messages=();
+my %prompts=();
+my %values=();
+my %defaults=();
+my %test=();
+my %errors=();
+my @toplevel=();
+my @daily_reports=();
+my @syslog=();
+my @rlog=();
+my @email_alarms=();
+
+
+my $forced_quit=0;
+
+banner();
+backup();
+
+populate();
+
+my $write='clear';
+
+while (($write eq 'clear') || ($write eq 'edit'))
+{
+DOKEY: foreach my $key (@toplevel)
+{
+		last DOKEY if $forced_quit;
+		my $value='';
+		my $parsed_ok=0;
+		while ((!$parsed_ok) && (!$forced_quit))
+		{
+			print "\n$messages{$key}\n";
+			$value = get_value($prompts{$key}, $defaults{$key});
+			print "++value entered: '$value'\n";
+			if ($value =~ /^\s*quit\s*$/i) {$forced_quit=1; last DOKEY;}
+			else
+			{
+				if ($value =~ /$test{$key}/) {$parsed_ok=1;} else {print "\nERROR! $errors{$key}\n\n";}
+			}
+			
+			if ($key eq 'log')
+			{
+				my $success=open(OutFile, ">>$value");
+				if (!$success)
+				{
+					print "ERROR - cannot create log file there!\n";
+					$parsed_ok=0;
+				}
+				else
+				{
+					close(OutFile);
+				}
+			}
+		}
+		$values{$key}=$value;
+		$defaults{$key}=$value;
+		
+		print "key is '$key' and value is $values{$key}\n";
+		if (!$forced_quit)
+		{
+			if (($key eq 'daily reports') && ($values{'daily reports'} eq 'on'))
+			{$forced_quit = do_secondary(\@daily_reports);}
+			
+			if (($key eq 'email alarms') && ($values{'email alarms'} eq 'on'))
+			{$forced_quit = do_secondary(\@email_alarms);}
+			
+			if (($key eq 'syslog') && ($values{'syslog'} eq 'on'))
+			{$forced_quit = do_secondary(\@syslog);}
+			
+			if (($key eq 'rlog') && ($values{'rlog'} eq 'on'))
+			{$forced_quit = do_secondary(\@rlog);}
+		}
+}
+	
+forced_quit() if $forced_quit;
+exit if ($forced_quit);
+
+# we can now show the configuration and prompt for a save
+
+print "Configuration entered:\n";
+display_values();
+
+$write = confirm_write();
+populate() if ($write eq 'clear');
+}
+
+write_config() if ($write eq 'write');
+print "no changes to configuration saved\n" if ($write ne 'write');
+
+
+print "leaving configuration tool...\n";
+exit;
+
+sub get_value
+{
+	
+	my ($msg, $default) = @_;
+	print "Press return to accept default value ($default)\nType quit to stop at any time\n";
+	print "$msg [$default]? ";
+	my $inline=<STDIN>;
+	chomp $inline;
+	$inline=~s/^\s+//; $inline=~s/\s+$//;
+	if ($inline eq '')
+	{
+		return $default;
+	}
+	else
+	{
+		return $inline;
+	}
+}
+
+
+sub populate
+{
+	@toplevel=();
+	@daily_reports=();
+	@syslog=();
+	@rlog=();
+	@email_alarms=();
+	
+	$messages{'mac'}='Are you running serverM on a MAC OS X compatible system (if you answer no then a
+generic Linux-ish system will be assumed which should work with most distros)';
+	$prompts{'mac'}='enter yes or no';
+	$values{'mac'}='';
+	$defaults{'mac'}='no';
+	$test{'mac'}='^yes|no$';
+	$errors{'mac'}='please answer yes or no';
+	push @toplevel, 'mac';
+	
+	$messages{'check cycle wait'}='Number of seconds to wait between check cycles (a lower number
+means that intrusions are detected more quickly but more resources are used)?';
+	$prompts{'check cycle wait'}='Enter number of seconds';
+	$values{'check cycle wait'}='';
+	$defaults{'check cycle wait'}='60';
+	$test{'check cycle wait'}='[0-9]+';
+	$errors{'check cycle wait'}='';
+	push @toplevel, 'check cycle wait';
+	
+	$messages{'log'}='Where would you like the log file to be written';
+	$prompts{'log'}='Enter path and name of log file';
+	$values{'log'}='';
+	$defaults{'log'}='./log/log.txt';
+	$test{'log'}='.*';
+	$errors{'log'}='';
+	push @toplevel, 'log';
+	
+	$messages{'administrator email'}='The administrator email address receives system messages from the serverM system 
+such as shutdown, pause, and start messages. It is important that this parameter is defined.';
+	$prompts{'administrator email'}='Enter the administrator email address';
+	$values{'administrator email'}='';
+	$defaults{'administrator email'}='root@localhost';
+	$test{'administrator email'}='^[^\@]+\@(([^\@]+\.(?:(?:co\.[a-zA-Z]+)|(?:org\.[a-zA-Z]+)|(?:net\.[a-zA-Z]+)|(?:com)|(?:net)|(?:biz)|(?:ws)))|(localhost)|([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}))$';
+	$errors{'administrator email'}='That does not appear to be a valid email address...';
+	push @toplevel,'administrator email';
+	
+	$messages{'reply'}='The reply-to email address defines which address is entered into the reply to
+field of any alarm, admin, or daily report message.';
+	$prompts{'reply'}='Enter the reply to email address';
+	$values{'reply'}='';
+	$defaults{'reply'}='root@localhost';
+	$test{'reply'}='^[^\@]+\@(([^\@]+\.(?:(?:co\.[a-zA-Z]+)|(?:org\.[a-zA-Z]+)|(?:net\.[a-zA-Z]+)|(?:com)|(?:net)|(?:biz)|(?:ws)))|(localhost)|([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}))$';
+	$errors{'reply'}='That does not appear to be a valid email address...';
+	push @toplevel,'reply';
+	
+	$messages{'mail server'}='The IP address or FQDN of an outbound email server to send admin and alarm emails
+if you do not intend to send emails from serverM then accept default server [localhost]';
+	$prompts{'mail server'}='IP or FQDN';
+	$values{'mail server'}='';
+	$defaults{'mail server'}='localhost';
+	$test{'mail server'}='.*';
+	$errors{'mail server'}='that does not appear to be a valid IP address or FDQN';
+	push @toplevel,'mail server';
+	
+	$messages{'daily reports'}='Do you want to receive daily reports by email?';
+	$prompts{'daily reports'}='Enter on or off';
+	$values{'daily reports'}='';
+	$defaults{'daily reports'}='off';
+	$test{'daily reports'}='(?:on)|(?:off)';
+	$errors{'daily reports'}="please enter value 'on' or 'off'";
+	push @toplevel,'daily reports';
+	
+	$messages{'email alarms'}='Do you want to receive alarm reports by email (email recipients are defined in
+the rules files, the administrator email defined above is used as the default recipient if
+you turn these email alarms on)?';
+	$prompts{'email alarms'}='Enter on or off';
+	$values{'email alarms'}='';
+	$defaults{'email alarms'}='on';
+	$test{'email alarms'}='(?:on)|(?:off)';
+	$errors{'email alarms'}="please enter value 'on' or 'off'";
+	push @toplevel,'email alarms';
+	
+	$messages{'syslog'}='Do you want to turn on the syslog facility?';
+	$prompts{'syslog'}='Enter on or off';
+	$values{'syslog'}='';
+	$defaults{'syslog'}='off';
+	$test{'syslog'}='(?:on)|(?:off)';
+	$errors{'syslog'}="please enter value 'on' or 'off'";
+	push @toplevel,'syslog';
+	
+	$messages{'rlog'}='Do you want to turn on the remote logging facility?';
+	$prompts{'rlog'}='Enter on or off';
+	$values{'rlog'}='';
+	$defaults{'rlog'}='off';
+	$test{'rlog'}='(?:on)|(?:off)';
+	$errors{'rlog'}="please enter value 'on' or 'off'";
+	push @toplevel,'rlog';
+	
+	$messages{'rlogip'}='What is the IP address or FQDN of the remote logging server?';
+	$prompts{'rlogip'}='Enter IP or FQDN';
+	$values{'rlogip'}='';
+	$defaults{'rlogip'}='localhost';
+	$test{'rlogip'}='.*';
+	$errors{'rlogip'}="please enter IP address of FDQN";
+	push @rlog,'rlogip';
+	
+	$messages{'rlogport'}='What is the IP address or FQDN of the remote logging server?';
+	$prompts{'rlogport'}='Enter UDP port number 1-65535';
+	$values{'rlogport'}='';
+	$defaults{'rlogport'}='4000';
+	$test{'rlogport'}='[0-9]{1,5}';
+	$errors{'rlogport'}="please enter port number from 1 to 65535";
+	push @rlog,'rlogport';
+	
+	$messages{'rlogkey'}='Do you want to encrypt remote logging traffic? If so, then enter a
+key (any string) here, otherwise accept the default empty string';
+	$prompts{'rlogkey'}='Enter encryption string if required';
+	$values{'rlogkey'}='';
+	$defaults{'rlogkey'}='none';
+	$test{'rlogkey'}='.*';
+	$errors{'rlogkey'}="please enter encryption string";
+	push @rlog,'rlogkey';
+	
+	$messages{'rlog include'}='Which kinds of log messages do you want to include in the remote logging?';
+	$prompts{'rlog include'}='Enter list from info, status, error, or enter all e.g. error,status';
+	$values{'rlog include'}='';
+	$defaults{'rlog include'}='all';
+	$test{'rlog include'}='((?:all)|(?:alarm)|(?:info)|(?:status)|(?:error))+';
+	$errors{'rlog include'}="please enter list from info, status, error, or enter all";
+	push @rlog,'rlog include';
+	
+	$messages{'rlog severity'}='Set the remote logging alarm severity level (all alarms of this severity or lower will be included)?';
+	$prompts{'rlog severity'}='Enter number 0 to 99';
+	$values{'rlog severity'}='';
+	$defaults{'rlog severity'}='1';
+	$test{'rlog severity'}='[0-9]{1,2}';
+	$errors{'rlog severity'}="please enter number from 0 to 99";
+	push @rlog,'rlog severity';
+	
+	$messages{'syslog include'}='Which kinds of log messages do you want to include in the syslog?';
+	$prompts{'syslog include'}='Enter list from info, status, error, or enter all e.g. error,status';
+	$values{'syslog include'}='';
+	$defaults{'syslog include'}='all';
+	$test{'syslog include'}='((?:all)|(?:alarm)|(?:info)|(?:status)|(?:error))+';
+	$errors{'syslog include'}="please enter list from info, status, error, or enter all";
+	push @syslog,'syslog include';
+	
+	$messages{'syslog level'}='Set the syslog level (default is 4 for info level)?';
+	$prompts{'syslog level'}='Enter number 0 to 9';
+	$values{'syslog level'}='';
+	$defaults{'syslog level'}='4';
+	$test{'syslog level'}='[0-9]';
+	$errors{'syslog level'}="please enter number from 0 to 9";
+	push @syslog,'syslog level';
+	
+	$messages{'syslog severity'}='Set the syslog alarm severity level (all alarms of this severity or lower will be included)?';
+	$prompts{'syslog severity'}='Enter number 0 to 99';
+	$values{'syslog severity'}='';
+	$defaults{'syslog severity'}='1';
+	$test{'syslog severity'}='[0-9]{1,2}';
+	$errors{'syslog severity'}="please enter number from 0 to 99";
+	push @syslog,'syslog severity';
+	
+	
+	$messages{'alarm throttle'}='Do you want to turn on email alarm throttling in order to limit
+email alarms to one email per day?';
+	$prompts{'alarm throttle'}='Enter on or off';
+	$values{'alarm throttle'}='';
+	$defaults{'alarm throttle'}='off';
+	$test{'alarm throttle'}='(?:on)|(?:off)';
+	$errors{'alarm throttle'}="please enter value 'on' or 'off'";
+	push @email_alarms,'alarm throttle';
+	
+	$messages{'email alarm format'}='Enter a format for alarm emails (html or text)';
+	$prompts{'email alarm format'}='Enter format for alarm emails as html or text';
+	$values{'email alarm format'}='';
+	$defaults{'email alarm format'}='html';
+	$test{'email alarm format'}='^html|text$';
+	$errors{'email alarm format'}='please enter HTML or text';
+	push @email_alarms, 'email alarm format';
+	
+	$messages{'daily report time'}='Enter a time to receive daily report emails. The time is specifed in
+a 24-hour clock format e.g. for 2.20pm (localtime) enter 1420';
+	$prompts{'daily report time'}='Enter time for daily report';
+	$values{'daily report time'}='';
+	$defaults{'daily report time'}='0900';
+	$test{'daily report time'}='^[012][0-9][0-5][0-9]$';
+	$errors{'daily report time'}='that does not appear to be a valid 24-hour clock time, please enter as HHMM format';
+	push @daily_reports, 'daily report time';
+	
+	$messages{'report format'}='Enter a format for daily report emails (html or text)';
+	$prompts{'report format'}='Enter format for daily report as html or text';
+	$values{'report format'}='';
+	$defaults{'report format'}='html';
+	$test{'report format'}='^html|text$';
+	$errors{'report format'}='please enter HTML or text';
+	push @daily_reports, 'report format';
+	
+	$messages{'daily report recipient1'}='Enter the email address of the first recipient (of a possible 3)
+who will receive a daily report by email. Note that the report may contain sensitive information
+so this recipient should be a trusted individual';
+	$prompts{'daily report recipient1'}='Enter email address for daily report recipient';
+	$values{'daily report recipient1'}='';
+	$defaults{'daily report recipient1'}='root@localhost';
+	$test{'daily report recipient1'}='^[^\@]+\@(([^\@]+\.(?:(?:co\.[a-zA-Z]+)|(?:org\.[a-zA-Z]+)|(?:net\.[a-zA-Z]+)|(?:com)|(?:net)|(?:biz)|(?:ws)))|(localhost)|([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}))$';
+	$errors{'daily report recipient1'}='that does not appear to be a valid email address...';
+	push @daily_reports, 'daily report recipient1';
+	
+	$messages{'daily report recipient2'}='Enter the email address of the second recipient (of a possible 3)
+who will receive a daily report by email. Note that the report may contain sensitive information
+so this recipient should be a trusted individual';
+	$prompts{'daily report recipient2'}='Enter email address for daily report recipient';
+	$values{'daily report recipient2'}='';
+	$defaults{'daily report recipient2'}='none';
+	$test{'daily report recipient2'}='^([^\@]+\@(([^\@]+\.(?:(?:co\.[a-zA-Z]+)|(?:org\.[a-zA-Z]+)|(?:net\.[a-zA-Z]+)|(?:com)|(?:net)|(?:biz)|(?:ws)))|(localhost)|([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})))|none$';
+	$errors{'daily report recipient2'}='that does not appear to be a valid email address...';
+	push @daily_reports, 'daily report recipient2';
+	
+	$messages{'daily report recipient3'}='Enter the email address of the third recipient (of a possible 3)
+who will receive a daily report by email. Note that the report may contain sensitive information
+so this recipient should be a trusted individual';
+	$prompts{'daily report recipient3'}='Enter email address for daily report recipient';
+	$values{'daily report recipient3'}='';
+	$defaults{'daily report recipient3'}='none';
+	$test{'daily report recipient3'}='^([^\@]+\@(([^\@]+\.(?:(?:co\.[a-zA-Z]+)|(?:org\.[a-zA-Z]+)|(?:net\.[a-zA-Z]+)|(?:com)|(?:net)|(?:biz)|(?:ws)))|(localhost)|([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})))|none$';
+	$errors{'daily report recipient3'}='that does not appear to be a valid email address...';
+	push @daily_reports, 'daily report recipient3';
+	
+	# push all defaults into values for completeness
+	foreach my $key (keys %values)
+	{$values{$key}=$defaults{$key} ;}
+	
+}
+
+sub do_secondary
+{
+	my $rfList = shift;
+	my @thelist=@$rfList;
+	
+	my $forced_quit=0;
+	DOSEC: foreach my $key (@thelist)
+	{
+			my $value='';
+			my $parsed_ok=0;
+			while ((!$parsed_ok) && (!$forced_quit))
+			{
+				print "\n$messages{$key}\n";
+				$value = get_value($prompts{$key}, $defaults{$key});
+				print "++value entered: '$value'\n";
+				if ($value =~ /^\s*quit\s*$/i) {$forced_quit=1; last DOSEC;}
+				else
+				{
+					if ($value =~ /$test{$key}/) {$parsed_ok=1;} else {print "\nERROR! $errors{$key}\n\n";}
+				}
+				
+			}
+			$values{$key}=$value;
+			print "key is '$key' and value is $values{$key}\n";
+	}
+	return $forced_quit;
+}
+
+
+sub backup
+{
+	`cp ./config/config.txt ./config/config.backup`;
+	print "existing configuration copied to ./config/config.backup\n";
+}
+
+sub banner
+{
+print<<ENDBANNER;
+
+serverM master configuration file creator V1.0
+type quit at any time to force quit with no changes
+
+starting configuration process...
+
+ENDBANNER
+}
+
+sub forced_quit
+{
+print<<FQ;
+
+Aborting configuration due to user entering 'quit'
+no changes will be made to configuration file
+
+FQ
+}
+
+sub table_two
+{
+	my $rfIn = shift;
+	my $rfOrder = shift;
+	
+	my %display = %$rfIn;
+	my @order = @$rfOrder; 
+	
+	my $maxlen=0;
+	foreach my $key (@order)
+	{
+		$maxlen = length($display{$key}) if (length($display{$key})>$maxlen);
+	}
+	
+	my $tablength=8;
+	
+	foreach my $key (@order)
+	{
+		print "$key:";
+		my $tabstops=int((($maxlen-length($key)) / $tablength)) + 1;
+		$tabstops++ if ($maxlen >= length($key));
+		$tabstops++;
+		print "\t"x$tabstops;
+		print "$display{$key}\n";
+	}
+}
+
+sub display_values
+{
+	table_two(\%values, \@toplevel);
+	if ($values{'daily reports'} eq 'on')
+	{
+		print "\nDaily reporting turned on - configuration:\n";
+		table_two(\%values, \@daily_reports);
+	}
+	
+	if ($values{'email alarms'} eq 'on')
+	{
+		print "\nEmail alarms turned on - configuration:\n";
+		table_two(\%values, \@email_alarms);
+	}
+	
+	if ($values{'syslog'} eq 'on')
+	{
+		print "\nSyslog facility turned on - configuration:\n";
+		table_two(\%values, \@syslog);
+	}
+	
+	if ($values{'rlog'} eq 'on')
+	{
+		print "\nRemote logging facility turned on - configuration:\n";
+		table_two(\%values, \@rlog);
+	}
+	
+}
+
+sub confirm_write
+{
+	my $command="";
+	
+	while ($command !~ /write|edit|clear|quit/i)
+	{
+		
+		print "\nYou now have four choices:\n";
+		print "\twrite - write the current config and exit\n";
+		print "\tedit - return to the beginning, but with the values you entered as defaults\n";
+		print "\tclear - return to the beginning with the original defaults\n";
+		print "\tquit - exit the system and make no changes to the config file\n";
+		print "\nWhat do you want to do?: ";
+		$command = <STDIN>;
+		chomp $command;
+	}
+	
+	return $command;
+}
+
+sub write_config
+{
+	# write the final config file
+	my $success=open(ConFile, ">./config/config.txt");
+	if (!$success)
+	{
+		print "cannot write configuration file, original file at './config/config.txt does not exist!\n";
+		print "aborting...\n\n";
+		exit;
+	}
+	
+	my $nt=localtime();
+	print ConFile "\n#configuraion file created by interactive configurator on $nt\n\n";
+	
+	print ConFile "status:on\n";
+	print ConFile "period:$values{'check cycle wait'}\n";
+	print ConFile "heartbeat:on\n";
+	if ($values{'log'} =~ /^\./)
+	{ $values{'log'} =~ s/^\./\%path/; }
+	
+	print ConFile "clear-on-pause:on\n";
+	
+	print ConFile "log-location:$values{'log'}\n";
+	print ConFile "administrator:$values{'administrator email'}\n";
+	print ConFile "smtp-reply:$values{'reply'}\n";
+	print ConFile "daily-report:$values{'daily reports'}\n";
+	print ConFile "report-format:$values{'report format'}\n";
+	print ConFile "daily-report-time:$values{'daily report time'}\n";
+	print ConFile "daily-report-email1:$values{'daily report recipient1'}\n";
+	
+	print ConFile "daily-report-email2:$values{'daily report recipient2'}\n" if ($values{'daily report recipient2'} ne 'none');
+	print ConFile "daily-report-email3:$values{'daily report recipient3'}\n" if ($values{'daily report recipient3'} ne 'none');
+	
+	print ConFile "alarm-emails:$values{'email alarms'}\n";
+	print ConFile "alarm-email-throttle:$values{'alarm throttle'}\n";
+	print ConFile "alarm-format:$values{'email alarm format'}\n";
+	
+	print ConFile "alarm-sms:off\nalarm-sms-throttle:on\nsms-gateway:none\n";
+	print ConFile "sms-to:none\n";
+
+	print ConFile "email-gateway:$values{'mail server'}\n";
+	
+	if ($values{'syslog'})
+	{
+		print ConFile "syslog-include:$values{'syslog include'}\n";
+		print ConFile "syslog-level:$values{'syslog level'}\n";
+		print ConFile "syslog-severity:$values{'syslog severity'}\n";
+	}
+	if ($values{'rlog'})
+	{
+		my $rlog_val="$values{'rlogip'}, $values{'rlogport'} ";
+		$rlog_val.= ", $values{'rlogkey'}" if ($values{'rlogkey'} ne 'none');
+		print ConFile "rlog:$rlog_val\n";
+		print ConFile "rlog-include:$values{'rlog include'}\n";
+		print ConFile "rlog-severity:$values{'rlog severity'}\n";
+	}
+	
+	if ($values{'mac'} eq 'no')
+	{
+		print ConFile "\nuser-def:LINUX\n";
+	}
+	else
+	{
+		print ConFile "\nuser-def:MAC OS X\n";
+	}
+	
+	print ConFile "\n\n";
+	close(ConFile);
+}
+	
+
+	

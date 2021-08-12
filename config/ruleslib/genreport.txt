@@ -1,0 +1,45 @@
+{ generate html report
+
+	def: execute generate_log_report ("nowait: perl -I '%path/lib' '%path/htmlreport' --
+		root:'%path/htmlreports' path:'%path' limit:50 log")
+	
+	def: execute generate_config_report ("nowait: perl -I %path/lib' '%path/htmlreport' --
+		root:'%path/htmlreports' path:'%path' limit:50 config log")
+	
+	def: execute generate_rules_report ("nowait: perl -I '%path/lib' '%path/htmlreport' --
+		root:'%path/htmlreports' path:'%path' limit:50 rules log")
+	
+	def: execute generate_all_report ("nowait: perl -I '%path/lib' '%path/htmlreport' --
+		root:'%path/htmlreports' path:'%path' limit:50 rules log config")
+		
+	generate html report if rules change::-
+		file change->%path/config/rules.txt::content:: --
+		execute(generate_rules_report)
+		
+	[severity 99] --
+	generate html report if ruleslib change::-
+		file change->%path/config/ruleslib/*.txt::content:: --
+		execute(generate_rules_report)
+		
+	[severity 99] --
+	generate html report if config change::-
+		file change->%path/config/config.txt::content:: --
+		execute(generate_config_report)
+		
+	[severity 1] --
+	[once only] --
+	generate all report::-
+		true::none::execute(generate_all_report)
+		
+					
+	[severity 99] --
+	[if-or *] generate new log report:: -
+		true::none::execute(generate_log_report)
+						
+	[severity 99] --
+	[on-day weekday] [every 60] --
+		regular make report::true::none:: -
+		execute(generate_all_report)
+		
+	
+}

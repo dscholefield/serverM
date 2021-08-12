@@ -1,0 +1,13 @@
+#!/bin/sh
+
+##
+# Start serverM in daemon mode 
+##
+
+. /etc/rc.common
+
+if [ "${SERVERM:=-NO-}" = "-YES-" ]; then
+    ConsoleMessage "Starting serverM service"
+    cd /usr/local/serverM
+    /usr/local/serverM/serverM -D
+fi

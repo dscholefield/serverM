@@ -1,0 +1,24 @@
+
+# this rule checks to see if the ftpd log has been changed
+# at unusual times or days, only one change to the file in 
+# any period will trigger an alarm
+
+{ ftp server access
+ 
+# attempt to access FTP server during unusual hours
+            
+	def: string ftp-log ("/var/log/ftpd.log")
+	
+	        [severity 3] -
+            [at-time 1800:2400, 0000:0600] -
+            [once until fail] --
+			late night ftp access::file change -> $$ftp-log$$::-
+            	content::email([administrator])
+ 
+           [severity 3] -
+           [on-day sat, sun] -
+           [once until fail] --
+			weekend ftp access::file change -> $$ftp-log$$::-
+            	content::email([administrator])
+ 
+}

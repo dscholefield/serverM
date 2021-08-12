@@ -1,0 +1,1701 @@
+#!/usr/bin/perl -I lib
+
+# the serverM intrusion detection and protection system
+# [serverM main engine perl script / source file]
+# D. Scholefield 2004, 2005, 2006 (www.port80.com)
+# Version 2.80 (Linux/Mac OS X/BSD)
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+use strict;
+use Cwd;
+
+use Data::Dumper;
+
+	
+use Time::Local;
+use parse_config;
+use parse_rules;
+use truecheck;
+use filechange;
+use sizecheck;
+use users;
+use statuscheck;
+use servicecheck;
+use daemonize;
+use Net::SMTP;
+use sendalarms;
+use Sys::Syslog;
+use rlog;
+
+# set/unset the global debug flag for log reports
+# changing this will produce output to STDOUT only
+# and most output will not appear if run in daemon mode (-D)
+our $global_debug = 0;
+
+our %global_ignores;
+our $install_path;
+our $report_sent_today=0;
+our $fatal_error=0;
+our $daily_sms_throttle;
+our $daily_email_throttle;
+our @alarm_report_sms;
+our @alarm_report_email;
+our $State;
+our $Context;
+our %in_daily_report;
+our $machine;
+our %config;
+our $pmachine;
+our %daily_report_dedup=();
+our $rfValStruct;
+our $rfOnceOnly;
+our $rfOnceUntilFail;
+our $rfValues;
+our $db;
+our $db_service;
+our %atTimes;
+our %onDays;
+our %master_email_alarms;
+our %master_sms_alarms;
+		
+our %trigger_count;
+our @alarm_reports;
+our $check_cycle_count=0;
+
+our %daily_pragma_check=();
+
+our $config_change;
+our $config_last_change;
+our $rules_change;
+our $rules_last_change;
+
+our $administrator="none";
+
+our %once_only=();
+our %once_until_fail=();
+our @allowed_rules=();
+our @not_allowed_rules=();
+
+our $first_time;
+our $sleep_time;
+our $clear_pause="off";
+
+our $startup_time;
+our $last_email;
+our $last_sms;
+our $last_config_change;
+our $last_rules_change;
+
+our $rfOrder;
+our $rfIfAndConditions;
+our $rfIfOrConditions;
+our $rfThrottleConditions;
+our $rfCycleConditions;
+our $rfInitialConditions;
+our %throttle_conditions;
+our %cycle_conditions;
+our %last_trigger=();
+our %time_last_trigger=();
+our %syslog_severity=();
+
+our @all_and_conditions;
+our @all_or_conditions;
+our %every_conditions;
+our %everyat_conditions;
+
+our %rules_files;
+our $full_rules_file_path;
+our %sent_parse_error;
+
+our $filechange_lib_ok;
+our $filechange_lib_reason;
+
+our $check_cycle_start=0;
+our $runtime_total=0;
+our $cycle_average=0;
+
+our $is_special=0;
+
+our %Config;
+our $not_terminated = 1;
+
+# we want to ignore 'nowait' execute statement processes (avoid zombies)
+$SIG{CHLD}= 'IGNORE';
+
+$SIG{HUP}=\&catch_hup;
+$SIG{TERM}=\&catch_term;
+our $isHupped=0;
+our $isTermed=0;
+
+
+
+sub catch_hup
+{
+       our $isHupped++;
+}
+
+sub catch_term
+{
+        our $isTermed=1;
+}
+
+our $is_daemon=0;
+our $is_parse=0;
+
+if ($#ARGV >= 0)
+{	
+	my $success = parse_options();
+	if (!$success) {help(); exit(1);}
+}
+
+banner();
+
+Startup();
+exit(0);
+
+sub Startup {
+    
+    # this is the main startup code, including daemonisation
+    # and calling the main loop routine do_ids()
+    
+    
+  $install_path = Cwd::cwd();
+
+
+  our $db = "$install_path/files.db";
+  our $db_service = "$install_path/services.db";
+  statuscheck::init();
+    
+    # we need to get the sleep time very early on
+    {
+    	my ($er_result, $rfErrorList, $LocalrfValStruct) = parse_config::parse(0,0,"$install_path/config");
+    	if (!$er_result)
+    	{
+    		# we have an error - we will stop here
+    		my $er_msg = join("\n", @$rfErrorList);
+    		add_to_log("error","error in configuration file config.txt: $er_msg",0);
+    		my @error_report=();
+    		push @error_report, "error in configuration file!";
+    		push @error_report, @$rfErrorList;
+    		send_error_email(\@error_report);
+    		# regardless of flags we are not in Daemonise mode yet
+    		# so we should display an error message before quitting
+    		print "++ ERROR ++ in configuration file:\n$er_msg\nquitting...\n";
+    		exit(0);
+    	}
+    	else
+    	{
+			my ($ip, $port, $key) = split(/\,/, $LocalrfValStruct->{'rlog'});
+			if ($key ne '')
+			{ $key =~s/^\s+//; $key=~s/\s+$//;
+				rlog::init($key);} else { rlog::init('');}
+			
+    		$sleep_time = $LocalrfValStruct->{'period'};
+    		$clear_pause = $LocalrfValStruct->{'clear-on-pause'};
+    		%config = %$LocalrfValStruct;
+    		$administrator = $config{'administrator'};
+    		
+    	}
+    }
+    
+    # put a software startup banner in the text log
+    log_banner();
+    
+    # the in_daily_report hash is used to
+    # avoid duplicates in daily report
+    %in_daily_report = ();
+    
+    $pmachine = "Unresolved server";       
+    
+    my @hostname_tmp = `echo \$HOSTNAME`;
+    if (@hostname_tmp[0] =~ /[A-Z0-9]/i)
+    {
+    	$pmachine = @hostname_tmp[0];
+    	chomp $pmachine;
+    }
+  
+    # we set the throttle memories to show a non-existant
+    # weekday number which is equivalent to 
+    # 'not sent yet today'
+                
+    $daily_sms_throttle = 7;
+    $daily_email_throttle = 7;
+                
+    %sent_parse_error = ();
+    $config_change = 0;
+    $rules_change = 0;
+    
+    $last_sms = "none";
+    $last_email = "none";
+    $startup_time = convert_timestamp();
+    $last_config_change="none";
+    $last_rules_change="none";
+    
+    # we need to zero the hash that keeps a note
+    # of all included rules files
+    
+    %rules_files = ();
+    $full_rules_file_path = "$install_path/config/rules.txt";
+    
+    # the %rules_file hash will record the time of the last
+    # change of each rules file
+    $rules_files{$full_rules_file_path} = 0;
+       
+    
+    # some functions need to know if this is the
+    # first time the system is being run rather than being woken
+    $first_time=1;
+    
+    # trigger_count counts the number of times each rule is triggered
+    %trigger_count = ();
+        
+   	if ($is_daemon) 
+   		{	DAEMONIZE::Init();}		
+    else
+    	{   print "in interactive mode, re-start with '-D' option to run as daemon\n";}
+    
+    add_to_log("status", "serverM system is starting",0);
+    
+		($filechange_lib_ok, $filechange_lib_reason) = filechange::init($db);
+		if (!$filechange_lib_ok)
+		{
+			my $msg="(file change) $filechange_lib_reason";
+			my @error_report = ();
+			push @error_report, $msg;
+			
+			add_to_log("error","$msg",0);
+			
+			send_error_email(\@error_report);
+		}
+	while(!$isTermed)
+    {
+    	if (!$isHupped) {main_loop();}
+    	else
+		{
+			if ($isHupped == 1) {Pause();}
+			else
+			{	
+				Continue(); $isHupped=0;
+			}
+		}
+    	sleep($sleep_time);
+    }
+    
+    
+	filechange::terminate($db);
+    # the service is stopping so we send the shutdown
+    # email if it is defined
+    if ($administrator ne "none")
+    {
+		my $is_sent = send_shutdown("shutdown");
+		add_to_log("error","failed to send shutdown email to $administrator!",0) if (!$is_sent);
+		add_to_log("info", "sent shutdown email to $administrator",0) if ($is_sent);
+    }
+    
+    add_to_log("status", "serverM system has stopped",0);
+    
+    
+}
+
+sub Pause {
+    # daemon is about to be suspended
+    if ($clear_pause eq "on")
+    {
+    	# we need to clear the once-only and once-until-fail rules
+    	# from the disallowed list
+    	push @allowed_rules, @not_allowed_rules;
+    	@not_allowed_rules=();
+    }
+    my $is_sent = send_shutdown("pausing");
+    add_to_log("error","failed to send pausing email to $administrator!",0) if (!$is_sent);
+    add_to_log("info", "sent pausing email to $administrator!",0) if ($is_sent);
+    add_to_log("status", "serverM system has paused",0);
+}
+
+sub Continue {
+    # daemon  will resume execution now
+    my $is_sent = send_shutdown("continuing");
+    add_to_log("error","failed to send continuing email to $administrator!",0) if (!$is_sent);
+    add_to_log("info", "sent continuing email to $administrator",0) if ($is_sent);
+    add_to_log("status","serverM system continuing",0);
+}
+
+
+
+       		
+ sub main_loop
+ {      			
+    
+    # the check cycle count is important - it is used in reporting and main
+    # functionality, it *always* increments
+    
+   	$check_cycle_count++;
+                
+	# main service running code
+	# exit from this loop periodically is vital
+	# to handle the interaction with the process SIGNAL system
+	
+	# start by re-reading the configuration if it has changed
+	$config_last_change = -M "$install_path/config/config.txt";
+	if (($config_last_change < $config_change) || ($config_change == 0))
+	{
+		
+		my ($er_result, $rfErrorList, $LocalrfValStruct) = parse_config::parse(0,0,"$install_path/config");
+		
+		$rfValStruct = $LocalrfValStruct;
+		$last_config_change = convert_timestamp();
+		
+		add_to_log("info", "configuration file changed - re-read file",0);
+		
+		my ($ip, $port, $key) = split(/\,/, $LocalrfValStruct->{'rlog'});
+			if ($key ne '')
+			{ 	$key =~s/^\s+//; $key=~s/\s+$//;
+				rlog::init($key);} else { rlog::init('');}
+			
+		# we need to handle the 'shutdown' paramter from the config file
+		# it can only be changed if there was none and now there is one
+		# it cannot be changed during execution (security measure!)
+		
+		if (($administrator eq "none") && ($rfValStruct->{'administrator'} ne "none"))
+		{
+			$administrator = $rfValStruct->{'administrator'};
+		}
+		
+		if (!$er_result)
+		{
+			# a value in $er_result shows there was an error in the config
+			my @error_report = ();
+			push @error_report, "Error reading config file";
+			add_to_log("error","there was an error reading the configuration file config.txt",0);
+			foreach my $msg (@$rfErrorList)
+			{
+				add_to_log("error","configuration file error: $msg",0);
+				push @error_report, $msg;
+			}
+			send_error_email(\@error_report);		
+		}
+		else {add_to_log("info","config file parsed OK",0);}
+		
+	}
+	
+	# if we are running in non-daemon mode,we can give some info
+	if ($is_parse) {print "\nCompleted parsing config file\n" if (!$is_daemon); exit(0);}
+	
+	if (!$fatal_error)
+	{
+		
+		%config = %$rfValStruct;
+		$clear_pause = $config{'clear-on-pause'};
+		$config_change = $config_last_change;
+		if ($config{'status'} ne "off")
+		{
+			# the config file parameter 'status' is not set to 'off'
+			my $ssmdx = seconds_since_midnight();
+			
+			if (seconds_since_midnight() < $config{'daily-report-time'} * 60)
+			{
+				# we need to reset the daily report sent flag
+				$report_sent_today = 0;
+			}
+			
+			# let's check and see if we need to generate the daily report
+			# we will only do this after the first check cycle, as long as
+			# the config 'period' is less than 12 hours (or we may miss one!)
+			
+			if (
+				($config{'daily-report'} eq "on")
+				&&
+				(seconds_since_midnight() > $config{'daily-report-time'} * 60)
+				&&
+				(!$report_sent_today)
+				&&
+				(($check_cycle_count > 1) || ($sleep_time > 43200))
+			   )
+			{
+				send_daily_report();
+				$report_sent_today = 1;
+			}
+			
+			
+				
+			# ok, now for the main part of the system
+			# we will reset the alarm data structure here
+			# carry out the intrusion checks, and then
+			# send alarm messages if we need to do so
+			
+			@alarm_report_sms = ();
+			@alarm_report_email = ();
+			
+			add_to_log("status","Heartbeat: starting check-cycle",0) if ($config{'heartbeat'} eq "on");
+			
+			# we will record the start time of the check-cycle
+			# so that we can calculat the average check cycle computation time
+			$check_cycle_start=time();
+			
+			# we need to check the report entries for alarms
+			@alarm_reports = ();
+			
+			
+			do_ids();			# this is the main function of the engine - the fun is in here!
+								# the alarm status hashes are returned (which may be empty)
+			
+			# we can now calculate the average computation time per check cycle
+			if ($check_cycle_count<2)
+			{
+				$cycle_average = 'none';
+			}
+			else
+			{ 	my $nowtime=time();
+				$runtime_total+=($nowtime - $check_cycle_start);
+				$runtime_total=1 if ($runtime_total == 0);
+				$cycle_average=$runtime_total /$check_cycle_count;
+				$cycle_average=sprintf("%.2f", $cycle_average);
+			}
+			
+			# @alarm_report_sms contains the SMS alarm reports
+			# @alarm_reports holds the alarm hashes for email alarms
+			if ((%master_sms_alarms != ()) || (%master_email_alarms != ()))
+			{
+				# some rules have generated alarms to send!
+				
+				# if there is no throttle set for
+				# the individual sms and email alerts
+				# or the throttle is set and one hasn't
+				# been sent yet today then we should send these too
+				
+				if	(
+						($config{'alarm-emails-status'} eq "on")
+						&&
+						(($daily_email_throttle != day_num()) || ($config{'alarm-emails-throttle'} eq "off"))
+						&&
+						(%master_email_alarms != ())
+					)
+					{
+						send_email_alarm();
+						$daily_email_throttle=day_num();
+					}
+	
+	
+				if 	(
+						($config{'alarm-sms-status'} eq "on")
+						&&
+						(($daily_sms_throttle != day_num()) || ($config{'alarm-sms-throttle'} eq "off"))
+						&&
+						(%master_sms_alarms != ())
+					)
+					{
+						send_sms_alarm();
+						$daily_sms_throttle=day_num();
+					}
+				
+				# deal with the alarm syslog and text log now
+				add_to_log("status","Heartbeat: check-cycle ended - alarms have been sent (av:$cycle_average secs)",0) if ($config{'heartbeat'} eq "on");
+			}
+			
+			# no alarms have been triggered 
+			else
+			{
+				add_to_log("status","Heartbeat: check-cycle ended - no alarm messages sent (av:$cycle_average secs)",0) if ($config{'heartbeat'} eq "on");
+			}
+		}
+		else
+		{
+			# qMon status is set to off so we stop doing anything for this check cycle! 
+		}
+	}
+        		
+} # end of main engine loop 
+
+
+# do_ids runs through the checking modules for
+# each type of rule and performs the checks, building 
+# the report if required
+
+sub do_ids
+{
+	# we will parse the rules every time in case
+	# of changes, we need to check all included
+	# rules files too, which we keep in a hash
+	# of file names
+	
+	my $has_changed = 0;
+	
+	# comment out this line if we want future functionality to
+	# stop sending repeated error messages in any form
+	%sent_parse_error = ();
+	
+	# we also need to check if any new files have
+	# been added to the ruleslib directory
+	
+	my $ruleslib_path = "$install_path/config/ruleslib";
+	my $success_ruleslib = opendir(RulesLib, "$ruleslib_path");
+	if (!$success_ruleslib)
+	{
+		my $msg="error in rules file(s) - can't read ruleslib $ruleslib_path!";
+		my @error_report = ();
+		push @error_report, $msg;
+		
+		add_to_log("error","$msg",0);
+		send_error_email(\@error_report);
+	}
+	else
+	{
+		my @rulesfiles = grep (/.*\.txt$/, readdir(RulesLib));
+		foreach my $rules_file (@rulesfiles)
+		{
+			my $filekey = "$install_path/config/ruleslib/$rules_file";
+			$rules_files{$filekey} = 0 if (!$rules_files{$filekey});
+		}
+		closedir(RulesLib);
+	}
+	
+	foreach my $next_rules_file (keys %rules_files)
+	{
+		$rules_last_change = -M $next_rules_file;
+		if ($rules_files{$next_rules_file} != $rules_last_change)
+		{
+		  $has_changed = 1;
+		}
+	}
+	my @name_list = ();
+		  
+	if ($has_changed)
+	{
+		parse_rules::init();
+		
+		# we will parse the rules with a debug value of 3 
+		# to ensure as many rules are parsed as possible despite errors
+		# a debug of zero will cause the parser to stop at the
+		# first error, which is undesirable
+		
+		my ($error_result, $rfErrors, $LocalrfValues, $LocalrfOnceOnly, $LocalrfOnceUntilFail, $rfLocalOrder, $rfLocalIfAndConditions, $rfLocalIfOrConditions, $rfLocalEvery, $rfLocalEveryAt, $rfRules_files, $rfGlobalIgnores, $rfErrorReports, $rfLocalAttimes, $rfLocalOnday, $rfLocalThrottle, $rfLocalCycle, $rfLocalInitial) = parse_rules::parse(3,0,"$install_path/config/rules.txt", \%config);
+		add_to_log("info","rules file changed - re-read file",0);
+		
+		# we need a copy of all the values read during the rules parsing
+		
+		%global_ignores = %$rfGlobalIgnores;
+		%rules_files = %$rfRules_files;
+		$rfValues = $LocalrfValues;
+		$rfOnceOnly = $LocalrfOnceOnly;
+	    $rfOnceUntilFail = $LocalrfOnceUntilFail;
+	  	$rfOrder = $rfLocalOrder;
+	  	$rfIfAndConditions = $rfLocalIfAndConditions;
+	  	$rfIfOrConditions = $rfLocalIfOrConditions;
+	  	$rfThrottleConditions = $rfLocalThrottle;
+	  	$rfCycleConditions = $rfLocalCycle;
+	  	$rfInitialConditions = $rfLocalInitial;
+	  	%atTimes = %$rfLocalAttimes;
+	  	%onDays = %$rfLocalOnday;
+	  	%throttle_conditions = %$rfLocalThrottle;
+	  	%cycle_conditions = %$rfLocalCycle;
+	  	%syslog_severity=%{$rfValues->{'severity'}};
+	  	@all_and_conditions = keys %$rfIfAndConditions;
+	  	@all_or_conditions = keys %$rfIfOrConditions;
+	  	%every_conditions = %$rfLocalEvery;
+	  	%everyat_conditions = %$rfLocalEveryAt;
+	  
+	  	$last_rules_change = convert_timestamp();
+				
+		add_to_log("info","rules file reading results:",0);
+		my $type_in = $rfValues->{type};
+		foreach my $name (keys %$type_in)
+		{ add_to_log("info", "parsed rule $name OK",0);
+			if ((!is_in($name, \@allowed_rules)) && (!is_in($name, \@not_allowed_rules)))
+			{
+				# it's a new rule - add it to the allowed list!
+				push @allowed_rules, $name;
+			}
+			$trigger_count{$name} = 0 if (!$trigger_count{$name});
+		 }
+		
+		# we need to remove deleted rules from the allowed and not allowed list too
+		# if the rules have been deleted since the previous parsing
+		{
+			@name_list = keys %$type_in;
+		
+			my %allowed_hash = map {$_ => 1} @allowed_rules;
+				my %not_allowed_hash = map {$_ => 1} @not_allowed_rules;
+			
+			foreach my $rule (@allowed_rules)
+			{	delete $allowed_hash{$rule} if (!is_in($rule, \@name_list));}
+		
+			foreach my $rule (@not_allowed_rules)
+			{	delete $not_allowed_hash{$rule} if (!is_in($rule, \@name_list));}
+ 
+			@allowed_rules = keys %allowed_hash;
+			@not_allowed_rules = keys %not_allowed_hash;
+		}
+		
+		# finally, if a rule was 'not allowed' but has been edited and
+		# should now be allowed, then we need to change that
+		# this is complex and anti-intuitive for the user
+		
+		foreach my $name (keys %$type_in)
+		{
+			if ((is_in($name, \@not_allowed_rules)) && (!$rfOnceOnly->{$name}) && (!$rfOnceUntilFail->{$name}))
+			{
+				move_not_to_allowed($name);
+			}
+		}
+						
+		
+		if (!$error_result)
+		{
+			my $msg="error in rules file(s)";
+			my @error_report = ();
+			my $new_parse_error = 0;
+			
+			add_to_log("error","$msg",0);
+			
+			# we only want to send the same error message about a failed file
+			# once, so we will record parse errors
+			
+			foreach my $er (@$rfErrors)
+			{
+				if (!$sent_parse_error{$er})
+				{
+					push @error_report, $er;
+					$sent_parse_error{$er} = 1;
+					$new_parse_error = 1;
+				}
+				add_to_log("error","$er",0);
+			}
+			if ($new_parse_error)
+			{
+				my @error_report_made = ();
+				push @error_report_made, "error in rules file(s)";
+				push @error_report_made, @error_report;
+				send_error_email(\@error_report_made);
+			}
+		}
+		else
+		{
+			add_to_log("info","rules file parsed OK",0);
+			%sent_parse_error = ();
+		}
+		
+   
+	   # we need to populate the allowed rules list
+	   # if this is the first time the rules have been read
+	   
+	   if ($first_time)
+	   {
+			$first_time=0;
+			@not_allowed_rules=();
+			# all rules mentioned in the rules-set are added
+			# because we will allow these to fire first time off
+			@allowed_rules = keys %{$rfValues->{'type'}};
+  		}
+	}
+
+  
+  	# we're going to dump out all kinds of information now into a structure   	
+  	# calling individual libraries to deal with each type of rule
+  	# we need to pass a lot of information to each library, specifically
+  	# - pointer the main rule values
+  	# - (optionally) the location of files needed by the library 
+  	# - a pointer to the list of allowed rules
+  	# - a pointer to a hash containing the current 'once only' rules
+  	# - a pointer to a hash containing the current 'once until fail' rules
+  	# - a pointer to the hash containing the trigger count for the rules
+  	#
+  	# we get back
+  	# - a pointer to the list of SMS rules triggered, along with the alarm message text
+  	# - a pointer to log entries which need to be written
+  	# - a pointer to a list of errors which were generated
+  	# - a pointer to a list of rules which were triggered by the library
+  	# - a pointer to a list of hashes, each hash containing a full email alarm content
+  	# - a pointer to an updated trigger count hash
+  	
+  	# we will regularise the call and return by passing the information in with
+  	# a single hash, and getting back a hash of results
+  	
+		# we need to determine which rules have been triggered
+		my @triggered_this_cycle=();
+		my $int_sms;
+		my $log;
+		my $alarm_log;
+		my $report;
+		my $errors;
+		my $rfHaveTriggered;
+		my $rfEvent_alarm_reports;
+		my  $rfTriggerCount;
+		%master_email_alarms = ();
+		%master_sms_alarms = ();
+		
+		# we need to execute the rules in the order given by the rules file
+	
+		my @error_summary = ();
+		
+		
+		my ($servicecheck_lib_ok, $servicecheck_lib_reason) = servicecheck::init($db_service);
+		if (!$servicecheck_lib_ok)
+		{
+			my $msg="(new service) $servicecheck_lib_reason";
+			my @error_report = ();
+			push @error_report, $msg;
+			
+			add_to_log("error","$msg",0);
+			
+			send_error_email(\@error_report);
+		}
+		
+		foreach my $next_rule (@$rfOrder)
+		{
+			
+			my $conditions_met = 1;
+						
+			if (is_in($next_rule, \@all_and_conditions))
+			{
+				# we have an if-and condition so we need to check
+				my @and_list = @{$rfIfAndConditions->{$next_rule}};
+				if (is_in('*', \@and_list))
+				{
+					@and_list = (@and_list = @allowed_rules);
+				}
+				
+				foreach my $depend_rule (@and_list)
+				{
+					if (! is_in($depend_rule, \@triggered_this_cycle))
+					{
+						$conditions_met = 0;
+					}
+				}	
+			}
+			
+			if ((is_in($next_rule, \@all_or_conditions)) && ($conditions_met == 1))
+			{
+				
+				# we have an if-and condition so we need to check
+				$conditions_met = 0;
+				my @or_list = @{$rfIfOrConditions->{$next_rule}};
+				if (is_in('*', \@or_list))
+				{
+					@or_list = @name_list;
+				}
+				
+				foreach my $depend_rule (@or_list)
+				{
+					
+					if (is_in($depend_rule, \@triggered_this_cycle))
+					{
+						$conditions_met = 1;
+					}
+				}
+					
+			}
+			
+			if (($atTimes{$next_rule}) && ($conditions_met == 1))
+			{
+				$conditions_met = 0;
+				my @timepairs = @{$atTimes{$next_rule}};
+				my $secsnow = seconds_since_midnight();
+				
+				TIMEPAIR: foreach my $timep (@timepairs)
+				{
+					my ($start_time,$end_time) = split(/:/, $timep);
+					$start_time = $start_time * 60;
+					$end_time = $end_time * 60;
+					
+					if (($secsnow >= $start_time) && ($secsnow <= $end_time)) 
+					{
+						$conditions_met = 1;
+						last TIMEPAIR;
+					}
+				}
+	  		}
+			
+			
+			if (($onDays{$next_rule}) && ($conditions_met == 1))
+			{
+				# check for a 'daily' value and appropriate disabled condition
+				# if it is there
+				
+				DAILYNAME: foreach my $dname (@{$onDays{$next_rule}})
+				{
+					if ($dname =~ /^\s*daily\s*/i)
+					{
+						if (defined $daily_pragma_check{$next_rule})
+						{ 
+							if ($daily_pragma_check{$next_rule} < (time() - 300))
+							{
+								# enough time has passed
+								last DAILYNAME;
+							}
+							else
+							{
+								$conditions_met = 0;
+								last DAILYNAME;
+							}
+							
+						}
+						
+					}
+				}
+				
+			}
+			
+			# we have 'used up' and on-day 'daily' value, so let's remove it
+			my $is_daily_removed=0;
+			if ($onDays{$next_rule})
+			{
+				my @list=@{$onDays{$next_rule}};
+				my $numels=@list;
+				if (($numels==1) && ($list[0] =~ /daily/))
+				{ $onDays{$next_rule} = undef; $is_daily_removed=1;}
+			}
+			
+			if (($onDays{$next_rule}) && ($conditions_met == 1))
+			{
+				$conditions_met = 0;
+				my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime();
+				my $dayName = (qw(Sun Mon Tue Wed Thu Fri Sat))[$wday];
+				
+				DAYNAME: foreach my $dname (@{$onDays{$next_rule}})
+				{
+					if (($dayName ne 'daily') && ($dayName =~ /$dname/i))
+					{
+						$conditions_met = 1;
+						last DAYNAME;
+					}
+				}
+				
+			}
+			
+			# this is a horrible kludge! but it works
+			if ((!$onDays{$next_rule}) && $is_daily_removed)
+			{ $onDays{$next_rule} = []; push @{$onDays{$next_rule}}, 'daily';}
+			
+			if (($every_conditions{$next_rule}) && ($conditions_met == 1))
+			{
+				if (($check_cycle_count % $every_conditions{$next_rule} == 0) || $check_cycle_count == 1)
+				{
+					$conditions_met = 1;
+				}
+				else
+				{
+					$conditions_met = 0;
+				}
+			}
+
+			if (($everyat_conditions{$next_rule}) && ($conditions_met==1))
+			{
+				if ((($time_last_trigger{$next_rule} + $everyat_conditions{$next_rule}) < time()) || $check_cycle_count == 1)
+				{ $conditions_met = 1;}
+				else
+				{ $conditions_met = 0;}
+			}
+			
+			if (($cycle_conditions{$next_rule}) && ($conditions_met == 1))
+			{
+				add_to_log("debug","debug: cycle condition of $cycle_conditions{$next_rule} found on rule $next_rule",0);
+				if ($check_cycle_count == $cycle_conditions{$next_rule}) 
+				{
+					add_to_log("debug","debug: cycle condition of $cycle_conditions{$next_rule} met",0);
+					$conditions_met = 1;
+				}
+				else
+				{
+					add_to_log("debug","debug: cycle condition of $cycle_conditions{$next_rule} not met",0);
+					$conditions_met = 0;
+				}
+			}
+			
+			
+			my $alarm_this_cycle = 1;
+			
+			if (($throttle_conditions{$next_rule}) && ($last_trigger{$next_rule}))
+			{
+				if (time() < ($throttle_conditions{$next_rule} + $last_trigger{$next_rule}))
+				{
+					$alarm_this_cycle = 0;
+				}
+			}
+			
+			if (($rfInitialConditions->{$next_rule}) && ($conditions_met==1))
+			{
+				$alarm_this_cycle=0 if ($check_cycle_count==1);
+			}
+			
+			if ($conditions_met)
+			{	
+				# we will build the hash to pass into the rules checking libraries
+				# which will be passed by ref 
+				
+				my %passHash = ();
+				$passHash{'name'} = $next_rule;
+				$passHash{'db'} = $db;
+				$passHash{'values'} = $rfValues;
+				$passHash{'path'} = $install_path;
+				$passHash{'allowed_rules'} = \@allowed_rules;
+				$passHash{'global_ignores'} = \%global_ignores;
+				$passHash{'once_only'} = $rfOnceOnly;
+				$passHash{'once_until_fail'} = $rfOnceUntilFail;
+				$passHash{'every'} = \%every_conditions;
+				$passHash{'trigger'} = \%trigger_count;
+				$passHash{'if_and'} = $rfIfAndConditions;
+				$passHash{'if_or'} = $rfIfOrConditions;
+				$passHash{'alarm'} = $alarm_this_cycle;
+				
+				my $typethisrule = $rfValues->{'type'}->{$next_rule};
+				
+				if ($typethisrule eq "true")
+				{
+					($int_sms, $alarm_log, $log, $report, $errors, $rfHaveTriggered, $rfEvent_alarm_reports, $rfTriggerCount) = truecheck::do_all_trues(\%passHash);
+					foreach my $alarm (@$alarm_log) {add_to_log("alarm", $alarm);}
+					generate_global_reports("TRUE rules", $int_sms,  $log);
+					push @error_summary, @$errors;
+					push @triggered_this_cycle, @$rfHaveTriggered;
+					build_master_alarms($rfEvent_alarm_reports) if ($alarm_this_cycle);
+					%trigger_count = %$rfTriggerCount;
+					syslog_alarms($next_rule, $alarm_log);
+					rlog_alarms($next_rule, $alarm_log);
+				}
+				
+				if (($typethisrule eq "file change") && ($filechange_lib_ok))
+				{
+					($int_sms, $alarm_log, $log, $report, $errors, $rfHaveTriggered, $rfEvent_alarm_reports, $rfTriggerCount) = filechange::report_on_file_changes(\%passHash);
+					foreach my $alarm (@$alarm_log) {add_to_log("alarm", $alarm);}
+					generate_global_reports("File change", $int_sms,  $log);
+					push @error_summary, @$errors;
+					push @triggered_this_cycle, @$rfHaveTriggered;
+					build_master_alarms($rfEvent_alarm_reports)  if ($alarm_this_cycle);
+					%trigger_count = %$rfTriggerCount;
+					syslog_alarms($next_rule, $alarm_log);
+					rlog_alarms($next_rule, $alarm_log);
+				}
+				if ($typethisrule eq "new service")
+				{
+					($int_sms, $alarm_log, $log, $report, $errors, $rfHaveTriggered, $rfEvent_alarm_reports, $rfTriggerCount) = servicecheck::report_on_services(\%passHash);
+					foreach my $alarm (@$alarm_log) {add_to_log("alarm", $alarm);}
+					generate_global_reports("Service check", $int_sms, $log);
+					push @error_summary, @$errors;
+					push @triggered_this_cycle, @$rfHaveTriggered;
+					build_master_alarms($rfEvent_alarm_reports)  if ($alarm_this_cycle);
+					%trigger_count = %$rfTriggerCount;
+					syslog_alarms($next_rule, $alarm_log);
+					rlog_alarms($next_rule, $alarm_log);
+				}
+				if ($typethisrule eq "users")
+				{
+					($int_sms, $alarm_log, $log, $report, $errors, $rfHaveTriggered, $rfEvent_alarm_reports, $rfTriggerCount) = users::do_users(\%passHash);
+					foreach my $alarm (@$alarm_log) {add_to_log("alarm", $alarm);}
+					generate_global_reports("Users", $int_sms,  $log);
+					push @error_summary, @$errors;
+					push @triggered_this_cycle, @$rfHaveTriggered;
+					build_master_alarms($rfEvent_alarm_reports)  if ($alarm_this_cycle);
+					%trigger_count = %$rfTriggerCount;
+					syslog_alarms($next_rule, $alarm_log);
+					rlog_alarms($next_rule, $alarm_log);
+				}
+				
+				if ($typethisrule eq "file size")
+				{
+					($int_sms, $alarm_log, $log, $report, $errors, $rfHaveTriggered, $rfEvent_alarm_reports, $rfTriggerCount) = sizecheck::report_on_filesize(\%passHash);
+					foreach my $alarm (@$alarm_log) {add_to_log("alarm", $alarm);}
+					generate_global_reports("File size", $int_sms, $log);
+					push @error_summary, @$errors;
+					push @triggered_this_cycle, @$rfHaveTriggered;
+					build_master_alarms($rfEvent_alarm_reports) if ($alarm_this_cycle);
+					%trigger_count = %$rfTriggerCount;
+					syslog_alarms($next_rule, $alarm_log);
+					rlog_alarms($next_rule, $alarm_log);
+				}
+				
+				if ($typethisrule eq "status")
+				{
+					($int_sms, $alarm_log, $log, $report, $errors, $rfHaveTriggered, $rfEvent_alarm_reports, $rfTriggerCount) = statuscheck::report_on_status(\%passHash);
+					foreach my $alarm (@$alarm_log) {add_to_log("alarm", $alarm);}
+					generate_global_reports("Status check", $int_sms, $log);
+					push @error_summary, @$errors;
+					push @triggered_this_cycle, @$rfHaveTriggered;
+					build_master_alarms($rfEvent_alarm_reports) if ($alarm_this_cycle);
+					%trigger_count = %$rfTriggerCount;
+					syslog_alarms($next_rule, $alarm_log);
+					rlog_alarms($next_rule, $alarm_log);
+				}
+				
+				
+				if (is_in($next_rule, $rfHaveTriggered))
+				{
+					$time_last_trigger{$next_rule}=time();
+					$daily_pragma_check{$next_rule}=time();
+					if ($alarm_this_cycle) {$last_trigger{$next_rule} = time();}
+				}
+					
+				
+			}
+			else
+			{
+				# do not check this rule - the pragma conditions are not met
+			}
+		}	
+		
+		servicecheck::terminate($db_service);
+		
+		compute_pragmas(\@triggered_this_cycle);
+		
+		if (@error_summary != ())
+		{
+			send_error_email(\@error_summary);
+			foreach my $er_line (@error_summary)
+			{
+				add_to_log("error","$er_line",0);
+			}
+		}
+		
+		
+}
+
+sub generate_global_reports
+{
+	my ($source, $int_sms, $log) = @_;
+	if (@$log != ()) 
+	{
+		foreach my $line (@$log)
+		{
+			$line = "general ($source) $line";
+			add_to_log("info","$line",0);
+		}
+	}
+	
+	if (@$int_sms != ()) 
+	{
+		foreach my $line (@$int_sms)
+		{
+			push @alarm_report_sms, $line;
+		}
+	}
+	
+}
+
+	
+# send_email_report sends an alarm email to the given email
+# recipients if required
+sub send_email_alarm
+{
+	
+	# the %master_email_alarms hash maps email addresses to alarm hashes
+	foreach my $email_address (keys %master_email_alarms)
+	{
+		
+		my @list = (); push @list, $email_address;
+		my $rfRecipients = \@list;
+		
+		my @alarms_in = @{$master_email_alarms{$email_address}};
+		
+		
+		if ($config{'alarm-format'} eq "html")
+		{
+			sendalarms::send_alarms("html", $master_email_alarms{$email_address}, $rfRecipients, $config{'email-gateway'}, $config{'smtp-reply'}, $pmachine);
+		}
+		else
+		{
+			sendalarms::send_alarms("text", $master_email_alarms{$email_address}, $rfRecipients, $config{'email-gateway'}, $config{'smtp-reply'}, $pmachine);
+		
+		}
+		$last_email = convert_timestamp();
+		
+	}
+}
+
+
+# send_sms_report sends an alarm sms to the given sms numbers
+# if required
+sub send_sms_alarm
+{
+	foreach my $sms_address (keys %master_sms_alarms)
+	{
+		
+			# we need to remove duplicate messages to make the SMS message smaller
+			my %non_dups = map {$_ => 1} @{$master_sms_alarms{$sms_address}};
+			my $msg = join(". ", keys %non_dups);
+				
+			add_to_log("info", "sending alarm SMS to $sms_address with $msg",0);
+			
+			if (!send_sms_alarm_stub($sms_address, $msg))
+			{
+				add_to_log("error","can't connect to SMTP server for email alarm!",0);
+				my @error_report = ();
+				push @error_report, "can't connect to SMTP server for email alarm!";
+				send_error_email(\@error_report);
+				return;
+			}
+		
+	}
+	$last_sms = convert_timestamp();
+	
+}
+
+sub send_sms_alarm_stub
+{
+	my $recipient = shift;
+	my $message = shift;
+	
+	my $nowTime = convert_timestamp();
+		
+	my $sms_gateway = $config{'sms-gateway'};
+	my $to_address = "$recipient\@$sms_gateway";
+	
+	my $smtp = Net::SMTP->new($config{'email-gateway'}) || return 0;
+
+	$smtp->mail($config{'sms-to'});
+	$smtp->to($to_address);
+	$smtp->data();
+	$smtp->datasend("Subject: serverM alarm \n");
+	$smtp->datasend("From: $config{'sms-to'}\n");
+	$smtp->datasend("To: $to_address\n");
+	my $smtp_date = smtp_timestamp(); $smtp->datasend("Date: $smtp_date\n");
+	$smtp->datasend("\n");
+
+	my $pmachine = $machine;
+	 
+	$smtp->datasend("serverM alarm for $pmachine \n");
+
+	$smtp->datasend("\n");
+	
+	if ($daily_sms_throttle)
+	{
+		$smtp->datasend("throttle \n");
+	}
+	
+	$smtp->datasend("$message\n");
+	
+	$smtp->dataend();
+
+	$smtp->quit;
+	add_to_log("info","SMS message sent to $recipient",0);
+		
+	return 1;
+}
+
+# send_daily_report sends the daily report email to the
+# given email addresses if required
+
+sub send_daily_report
+{
+	my $rfRecipients = $config{'daily-report-emails'};
+	my @recipients = @$rfRecipients;
+	my $allRecips = join('*', @recipients);
+	
+	my %tmpStatus = ();
+	$tmpStatus{'startup'} = $startup_time;
+	$tmpStatus{'count'} = $check_cycle_count;
+	$tmpStatus{'lastsms'} = $last_sms;
+	$tmpStatus{'lastemail'} = $last_email; 
+	$tmpStatus{'lastconfig'} = $last_config_change;
+	$tmpStatus{'lastrules'} = $last_rules_change;
+	
+	add_to_log("info","sending html daily report to $allRecips",0);
+	
+	if ($config{'report-format'} eq "html")
+	{
+		
+		sendalarms::send_daily_report("html", \%tmpStatus, \%trigger_count, $rfOnceOnly, $rfOnceUntilFail, \@not_allowed_rules, \%config, $rfRecipients, $config{'email-gateway'}, $config{'smtp-reply'}, $pmachine); 
+	}
+	else
+	{
+		
+		sendalarms::send_daily_report("text", \%tmpStatus, \%trigger_count, $rfOnceOnly, $rfOnceUntilFail, \@not_allowed_rules, \%config, $rfRecipients, $config{'email-gateway'}, $config{'smtp-reply'}, $pmachine); 
+	}
+	
+}
+
+# add_to_daily_report expects a string, and adds a timestamped
+# comment to the daily report
+sub add_to_daily_report
+{
+	my $message = shift;
+	if (!$daily_report_dedup{$message})
+	{
+		open(DailyReport, ">>$install_path/tmp/daily.txt");
+		my $ltime=convert_timestamp(localtime());
+		print DailyReport "$ltime $message\n";
+		close(DailyReport);
+		$daily_report_dedup{$message}=1;
+	}
+}
+
+# add_to_log expects a string, and adds a timestamped
+# comment to the log
+sub add_to_log
+{
+	my $type=shift;
+	my $message = shift;
+	my $severity = shift; # not currently used
+	
+	return if (($type =~ /debug/i) && (!$global_debug));
+	chomp $message;
+	$message =~ s/\n/ /g;
+	$message = "[$type] $message";
+	my $ltime='';
+	
+	{	my $log_location="$install_path/log/log.txt";
+		if ($config{'log-location'} ne '')
+		{	$log_location=$config{'log-location'}; }
+	
+		open(DailyReport, ">>$log_location");
+		$ltime=convert_timestamp();
+	
+		print DailyReport "$ltime ($check_cycle_count) $message\r\n";
+		close(DailyReport);
+	}
+	
+	if ((($config{'syslog-include'} =~ /$type/i) || ($config{'syslog-include'} =~ /all/i)) && ($type ne 'alarm'))
+	{
+		do_syslog($message);
+	}
+	if ((($config{'rlog-include'} =~ /$type/i) || ($config{'rlog-include'} =~ /all/i)) && ($type ne 'alarm'))
+	{
+		do_rlog("$ltime ($check_cycle_count) $message");
+	}
+}
+
+sub syslog_alarms
+{
+	my $rulename = shift;
+	my $rfLog = shift;
+	
+	if (($config{'syslog-level'}) && ($syslog_severity{$rulename} <= $config{'syslog-severity'}))
+	{
+		foreach my $alarm (@$rfLog)
+		{
+			do_syslog("[alarm] $alarm");
+		}
+	}
+}
+
+sub do_syslog
+{
+	my $msg = shift;
+	$msg = "($check_cycle_count) $msg";
+	openlog('serverM', 'cons,pid', 'user');
+	syslog($config{'syslog-level'}, $msg);
+	closelog();
+}
+
+sub do_rlog
+{
+	my $msg = shift;
+	$msg = "{$pmachine} $msg";
+	my ($target_ip, $target_port, $target_key) = split(/\,/, $config{'rlog'});
+	$target_ip =~ s/^\s+//; $target_ip =~ s/\s+$//;
+	$target_port =~ s/^\s+//; $target_port =~ s/\s+$//;
+	$target_key =~ s/^\s+//; $target_key =~ s/\s+$//;
+	# print "\nUDP message sent to '$target_ip' on port '$target_port' ($config{'rlog'})\n";
+	rlog::send($target_ip, $target_port, $target_key, $msg);
+}
+
+sub rlog_alarms
+{
+	my $rulename = shift;
+	my $rfLog = shift;
+	
+	if (($config{'rlog'} ne '') && ($syslog_severity{$rulename} <= $config{'rlog-severity'}))
+	{
+		foreach my $alarm (@$rfLog)
+		{
+			my $ltime=convert_timestamp();
+			do_rlog("$ltime ($check_cycle_count) [alarm] $alarm");
+		}
+	}
+}
+sub smtp_timestamp
+{
+   	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime();
+	$year+=1900;
+	my $monName = (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[$mon];
+	my $dayName = (qw(Sun Mon Tue Wed Thu Fri Sat))[$wday];
+	
+	if ($sec<10) {$sec="0$sec";}
+	if ($min<10) {$min="0$min";}
+	if ($hour<10) {$hour="0$hour";}
+	
+	# e.g. Date: Wed, 16 Jun 2004 13:02:21 +0100 (BST)
+	# Date: Tue, 22 Jun 2004 22:19:27 +0100
+	my $retString = "$dayName, $mday $monName $year $hour:$min:$sec";
+	$retString .= " +0100 (BST)" if ($isdst);
+	return $retString;
+	
+
+}
+sub convert_timestamp
+{
+   	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime();
+	$year+=1900;
+	my $monName = (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[$mon];
+	my $dayName = (qw(Sun Mon Tue Wed Thu Fri Sat))[$wday];
+	
+	if ($sec<10) {$sec="0$sec";}
+	if ($min<10) {$min="0$min";}
+	if ($hour<10) {$hour="0$hour";}
+	
+	return "$dayName $mday $monName $year : $hour:$min:$sec";
+
+}
+
+sub lastMidnight
+{
+	
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	# ok, let's get the first second of today
+	$sec = 0; $min = 0; $hour = 0; # that's the previous midnight
+
+	my $midnight = Time::Local::timelocal($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst);
+	
+	return $midnight;
+}
+
+sub seconds_since_midnight
+{
+	
+	my $lm = lastMidnight();
+	
+	my $ssm = time() - $lm;
+	
+	return $ssm;
+}
+
+
+sub day_num
+{
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	return $wday;
+}
+
+sub send_error_email
+{
+	my $rfErrorReport = shift;
+	my $nowTime = convert_timestamp();
+	
+	if ($administrator eq "none")
+	{
+		add_to_log("info","not sending error report by email, no administrator email address is configured",0);
+		return;
+	}
+	
+	add_to_log("info","sending error report email to $administrator at gateway $config{'email-gateway'}",0);
+
+
+	my $smtp = Net::SMTP->new($config{'email-gateway'}) || return 0;
+
+	$smtp->mail($config{'smtp-reply'});
+	$smtp->to($administrator);
+	$smtp->data();
+		
+	$smtp->datasend("Subject: serverM error report for $pmachine [$nowTime]\n");
+	$smtp->datasend("From: $config{'smtp-reply'}\n");
+	$smtp->datasend("To: $administrator\n");
+	my $smtp_date = smtp_timestamp(); $smtp->datasend("Date: $smtp_date\n");
+	$smtp->datasend("\n\n");
+	
+	
+	
+	$smtp->datasend("You are receiving this email because you are the nominated administrator\n");
+	$smtp->datasend("for the serverM Intrusion Detection System for server $pmachine\n");
+	$smtp->datasend("There has been a system error. Details follow...\n\n");
+	
+	foreach my $line (@$rfErrorReport)
+	{
+		$smtp->datasend("$line\n");
+	}
+	$smtp->dataend();
+
+	$smtp->quit;
+		
+	return 1;
+}
+
+sub send_shutdown
+{
+	my $type = shift;
+	my $nowTime = convert_timestamp();
+		
+	add_to_log("info","sending $type email to $administrator",0);
+
+
+	my $smtp = Net::SMTP->new($config{'email-gateway'}) || return 0;
+	
+
+	
+	$smtp->mail($config{'smtp-reply'});
+	$smtp->to($administrator);
+	$smtp->data();
+	
+	if ($type eq "shutdown")
+	{	$smtp->datasend("Subject: serverM shutdown report for $pmachine [$nowTime]\n");}
+	if ($type eq "pausing")
+	{$smtp->datasend("Subject: serverM pause report for $pmachine [$nowTime]\n");}
+	if ($type eq "continuing")
+	{$smtp->datasend("Subject: serverM continue report for $pmachine [$nowTime]\n");}
+	
+	$smtp->datasend("From: $config{'smtp-reply'}\n");
+	$smtp->datasend("To: $administrator\n");
+	my $smtp_date = smtp_timestamp(); $smtp->datasend("Date: $smtp_date\n");
+	$smtp->datasend("\n");
+
+	if ($type eq "shutdown")
+	{$smtp->datasend("serverM shutdown report for server $machine at $nowTime\n");}
+	if ($type eq "pausing")
+	{$smtp->datasend("serverM pause report for server $machine at $nowTime\n");}
+	if ($type eq "continuing")
+	{$smtp->datasend("serverM continue report for server $machine at $nowTime\n");}
+	
+	$smtp->datasend("\n");
+	
+	if ($type eq "shutdown")
+	{$smtp->datasend("The serverM system is shutting down. Here is the netstat report\n");}
+	if ($type eq "pausing")
+	{$smtp->datasend("The serverM system is pausing. Here is the netstat report\n");}
+	if ($type eq "continuing")
+	{$smtp->datasend("The serverM system is continuing.\n");}
+	
+	if (($type eq "shutdown") || ($type eq "pausing"))
+	{
+		my @netstat_report = `netstat -a`;
+		
+		foreach my $line (@netstat_report)
+		{
+			$smtp->datasend("$line\n");
+		}
+	}
+	
+	if ($type eq "continuing")
+	{
+		$smtp->datasend("The serverM system is continuing after being paused.\n");
+	}
+	
+	$smtp->dataend();
+
+	$smtp->quit;
+		
+	return 1;
+}
+
+ 
+# we need to deal with the pragmas
+
+sub compute_pragmas
+{
+	my $rfHT = shift;
+	
+	# first those rules which are once only and have
+	# been triggered are moved from the allowed to the not allowed
+	# then those which are once until false have to be removed
+	# from the not allowed to the allowed if they have triggered
+	
+	foreach my $name (@$rfHT)
+	{
+		if (($rfOnceOnly->{$name}) && (is_in($name, \@allowed_rules)))
+		{
+			add_to_log("info","rule $name is 'once only' and has been triggered, now inactive",0);
+			move_allowed_to_not($name);
+		}
+	}
+	
+	# if there is a rule which is not allowed (it's triggered before)
+	# but it triggered this time then we need to add it to the
+	# allowed list for next time
+	
+	foreach my $name (@not_allowed_rules)
+	{
+		if (
+					($rfOnceUntilFail->{$name}) 
+					&& (!(is_in($name, $rfHT)))
+			)
+		 	{move_not_to_allowed($name); }
+		
+	}
+
+	# if a once-until-fail rule is allowed (not yet been triggered)
+	# but it triggered this time, we need to move it to the
+	# not allowed list
+	
+	foreach my $name (@$rfHT)
+	{
+		if (($rfOnceUntilFail->{$name}) && (is_in($name, \@allowed_rules)))
+		{
+			add_to_log("info","rule $name is 'once until fail' and has been triggered, now inactive until fail",0);
+			move_allowed_to_not($name);
+		}
+	}
+}
+ 
+# is_in is a support sub to check if a value is in a list
+sub is_in
+{
+	my $element = shift;
+	my $rfList = shift;
+	
+	my %to_hash = map {$_ => 1} @$rfList;
+	if ($to_hash{$element}) {return 1;}
+	return 0;
+}
+
+
+sub move_not_to_allowed
+{
+	my $name = shift;
+	my %to_hash = map {$_ => 1} @not_allowed_rules;
+	delete $to_hash{$name};
+	@not_allowed_rules = keys %to_hash;
+	push @allowed_rules, $name;
+}
+
+sub move_allowed_to_not
+{
+	my $name = shift;
+	my %to_hash = map {$_ => 1} @allowed_rules;
+	my $debug_key = delete $to_hash{$name};
+	@allowed_rules = keys %to_hash;
+	push @not_allowed_rules, $name;
+}
+
+sub dump_rules
+{
+	my $prefix =shift;
+	foreach my $rule (@allowed_rules)
+	{ add_to_log("$prefix: Allowed rule: $rule");}
+	foreach my $rule (@not_allowed_rules)
+	{ add_to_log("$prefix: Not allowed rule: $rule");}
+}
+
+
+
+sub build_master_alarms
+{
+	my $rfalarm_hash = shift;
+	my $to_dump;
+	
+	foreach my $next_alarm (keys %$rfalarm_hash)
+	{
+		if ($next_alarm =~ /\@/)
+		{
+			# it's an email alarm
+			if ($master_email_alarms{$next_alarm})
+			{
+				# we already have at least one email alarm for this address
+				foreach my $rfAlarmHash (@{$rfalarm_hash->{$next_alarm}})
+				{
+					push @{$master_email_alarms{$next_alarm}},$rfAlarmHash ;
+				}
+				
+			}
+			else
+			{
+				
+				$master_email_alarms{$next_alarm}=$rfalarm_hash->{$next_alarm};
+				
+			}
+		}
+		
+		else
+		{
+			# it's an sms alarm
+			if ($master_sms_alarms{$next_alarm})
+			{
+				# we already have at least one sms alarm for this number
+				foreach my $rfAlarmHash (@{$rfalarm_hash->{$next_alarm}})
+				{
+					push @{$master_sms_alarms{$next_alarm}},$rfAlarmHash ;
+				}
+				
+			}
+			else
+			{
+				$master_sms_alarms{$next_alarm}=$rfalarm_hash->{$next_alarm};
+			}
+		}
+		
+	}	
+	
+}
+
+sub help
+{
+return if $is_daemon;
+
+print "serverM Host-based intrusion detection system version 2.01 (Unix)\n";
+print "Usage: watcher [-dph]\n";
+print "\n\t-D\trun watcher as daemon\n";
+print "\t-p\tparse rules and exit\n";
+print "\t-x\tspcial flag on (prints debug info to STDOUT for non daemon mode\n";
+print "\t-h\tprint this help message\n";
+}
+
+sub parse_options
+{
+	my $success = 1;
+	OPTION: foreach my $opt (@ARGV)
+	{
+		if ($opt =~ /-D/)
+		{
+			$is_daemon = 1;
+			next OPTION;
+		}
+		
+		if ($opt =~ /-p/)
+		{
+			$is_parse = 1;
+			next OPTION;
+		}
+		
+		if ($opt =~ /-x/i)
+		{
+			$is_special = 1;
+			next OPTION;
+		}
+		if ($opt =~ /-h/)
+		{
+			help();
+			exit(0);
+		}
+		$success = 0;
+		print "Don't understand option $opt!\n";
+	}
+	
+	return $success;
+}
+
+sub banner
+{
+return if $is_daemon;
+
+	print<<ENDBANNER;
+	
+serverM Intrusion Detection and Protection System - V2.2 (*unix)
+[written by David Scholefield (www.port80.com)]
+	
+This software is protected by the Gnu Public License, you are free to
+copy and distribute. Please refer to the license reproduced in the
+LICENSE file in the original distribution for details.
+	
+ENDBANNER
+}
+
+sub log_banner
+{
+	add_to_log("info",'+++++');
+	add_to_log("info",'serverM Intrusion Detection and Protection System - V2.2 (*unix)');
+	add_to_log("info",'[written by David Scholefield (www.port80.com)]');
+	add_to_log("info",'This software is protected by the Gnu Public License');
+	add_to_log("info", 'see LICENSE file in distribution');
+	add_to_log("info",'+++++');
+}
+
+	
+
+		

@@ -1,0 +1,32 @@
+
+#configuraion file created by interactive configurator on Fri Mar 17 15:25:32 2006
+
+status:on
+period:60
+heartbeat:on
+clear-on-pause:on
+log-location:%path/log/log.txt
+administrator:root@localhost.com
+smtp-reply:root@localhost.com
+daily-report:on
+report-format:text
+daily-report-time:0900
+daily-report-email1:root@localhost.com
+alarm-emails:on
+alarm-email-throttle:off
+alarm-format:text
+alarm-sms:off
+alarm-sms-throttle:on
+sms-gateway:none
+sms-to:none
+email-gateway:127.0.0.1
+syslog-include:all
+syslog-level:4
+syslog-severity:9
+rlog:127.0.0.1, 4000 
+rlog-include:all
+rlog-severity:1
+
+user-def:LINUX
+
+

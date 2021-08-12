@@ -1,0 +1,38 @@
+
+##
+## serverM README
+##
+
+serverM V2.2 (*nix)
+By David Scholefield port80.com (serverm@port80.com)
+serverM website http://www.serverm.org
+
+see serverM user manual distributed with system
+(docs/manual.pdf)
+
+REQUIREMENTS
+
+		Perl 5+
+		Perl libraries:
+		Cwd
+		Digest::MD5
+		File::Find
+		File::Basename
+		POSIX
+		Net::SMTP
+		MIME::Lite
+		Storable
+		Sys::Syslog
+		Crypt::CBC
+		Crypt::Blowfish
+
+        
+INSTALLATION
+
+        ./configure
+        ./serverM -D
+
+KNOWN ISSUES
+
+        None currently, but please report any that you find
+

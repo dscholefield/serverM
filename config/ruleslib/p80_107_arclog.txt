@@ -1,0 +1,14 @@
+# perform automatic archiving of serverM log only when the log
+# reaches over 5K
+
+# substitute destination directory c:\temp to appropriate location
+# destination files are named sM[timestamp].txt
+# This rule is evaluated approximately once every 10 mins (assuming
+# watcher service period is set to default of 60)
+
+def: execute archive-log ("cp '%path/log/log.txt' /tmp/sM%df.txt --
+		; rm '%path/log/log.txt'")
+
+[every 10] _library_ arclog archive serverM log::file size->%path/log/log.txt:: -
+			>500k::execute(archive-log)
+			

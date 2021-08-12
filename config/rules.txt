@@ -1,0 +1,278 @@
+
+# example configuration file for serverM, part of the
+# serverM detection and prevention system
+# D. Scholefield 2004, 2005, 2006 (www.port80.com)
+# Version 2.80 (Linux/Mac OS X/BSD)
+
+# This program/file is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+# can be used for LINUX and MAC OS X systes
+# define parameter 'user-def:LINUX' or 'user-def:MAXC OS X' in master
+# configuration file to ensure correct definitions/rules are
+# parsed
+
+# by default all email alarms are sent to [administrator] - defined
+# in the master configuration file
+
+# check for SETUID and GETUID files regularly
+# find command common syntax to most *nix variants
+
+	def: execute setuid ("find / -type f -perm 4000 -print")
+	def: execute getuid ("find / -type f -perm 2000 -print")
+
+	[severity 3] --
+	[initial] --
+	[on-day daily] --
+	[at-time 0000:0200] --
+	[once until fail] --
+		check setuid::status setuid::baseline::email([administrator])
+
+
+	[severity 3] --
+	[initial] --
+	[on-day daily] --
+	[at-time 0000:0200] --
+	[once until fail] --
+		check getuid::status getuid::baseline::email([administrator])
+
+
+# alarm if new users are found, or existing ones changed or removed
+# LINUX uses flat file format, MAC OS X uses LDAP database
+
+ifdef LINUX
+	[severity 3] --
+		check passwd file::file change->/etc/passwd::content:: --
+			email([administrator])
+
+	[severity 3] --
+		check shadow file::file change->/etc/shadow::content:: --
+			email([administrator])
+enddef
+
+ifdef MAC OS X
+{ passwd file change from nidump
+	def: execute get-passwd ("nidump passwd .")
+	[severity 3]--
+		check nidump passwd file::status get-passwd::baseline:: --
+			email([administrator])
+}
+enddef
+
+
+# check for unauthorised access attempts in the system log
+
+ifdef MAC OS X
+{ failed login attempts
+
+	def: execute three_failed_in_hour ("'%path/scour' -yesno num:6 previous:01:00:00 pattern:'Authentication failure' file:/var/log/system.log")
+
+	def: execute keep-logstatus ("cp /var/log/system.log '%path/%df.log'")
+
+	[severity 1] --
+	[once until fail] --
+	[initial] --
+		check failed login::status three_failed_in_hour::baseline::-
+			email([administrator]), -
+			execute(keep-logstatus)
+}	
+enddef
+
+ifdef LINUX
+{ failed login attempts
+
+	def: execute three_failed_in_hour ("'%path/scour' -yesno num:6 previous:01:00:00 pattern:'Authentication failure' file:/var/log/syslog")
+
+	def: execute keep-logstatus ("cp /var/log/syslog '%path/log/%df.log'")
+
+	[severity 1] --
+	[once until fail] --
+	[initial] --
+		check failed login::status three_failed_in_hour::baseline::-
+			email([administrator]), -
+			execute(keep-logstatus)
+}	
+enddef
+
+
+# look for changes to core config files, same for most variants of *nix
+
+	[severity 3] --
+	[initial] --
+		check config files::file change->/etc/*.conf::content recurse:5::--
+			email([administrator])
+
+			
+			
+# check for new disks being mounted, same for most variants of *nix
+
+	def: execute get_volume_list ("mount | sort")
+	[severity 9] --
+	[once until fail] --
+		check new volumes mounted::status get_volume_list::none::-
+			email([administrator])
+			
+# check for interactive logins at unusual times, same for most variants of *nix
+# note that changes are what we are interested in
+
+	def: execute who ("who")
+
+	[severity 1] --
+	[at-time 2000:2400, 0000:0800] --
+	[once until fail] --
+		login at unusual time::status who::none::email([administrator])
+
+
+# ensure key processes are running
+ifdef LINUX
+{ key process check
+
+	def: execute start-cron ("/etc/init.d/cron start")
+
+	[severity 2] --
+	[every 10] --
+		cronis running::new service::lookfor:/usr/sbin/cron::-
+			email([administrator]), -
+			execute(start-cron)
+
+	def: execute start-syslog ("/etc/init.d/syslog start")	
+
+	[severity 2] --
+	[every 10] --
+		syslog is running::new service::lookfor:/sbin/syslogd::-
+			email([administrator]), -
+			execute(start-syslog)
+}
+enddef	
+
+ifdef MAC OS X
+{ key process check
+
+	def: execute start-cron ("cron start")
+
+	[severity 2] --
+	[every 10] --
+		cronis running::new service::lookfor:/usr/sbin/cron::-
+			email([administrator]), -
+			execute(start-cron)
+
+	def: execute start-syslog ("syslog start")	
+
+	[severity 2] --
+	[every 10] --
+		syslog is running::new service::lookfor:/usr/sbin/syslogd::-
+			email([administrator]), -
+			execute(start-syslog)
+}
+enddef
+
+# any service that starts during unusual hours we are interested in
+
+{ new service at night
+
+	ignore: service "/usr/sbin/backup"
+	ignore: service "%path/htmlreport"
+	
+
+	[severity 10] --
+	[at-time 2000:2400, 0000:0600] --
+		new service at unusual time::new service::none::-
+			email([administrator])
+}
+
+# check for root user bashrc and profile changes
+ifdef LINUX
+{ root profile changes
+
+	[severity 3] --
+	[every 20] --
+		root user profile change::file change -> ~root/.profile::content::-
+			email([administrator])
+
+	[severity 3] --
+	[every 20] --
+		root user bashrc change::file change -> ~root/.bashrc::content::-
+			email([administrator])
+}
+enddef
+
+# check for root user bashrc and profile changes
+ifdef MAC OS X
+{ root profile changes
+
+	[severity 3] --
+	[every 20] --
+		root user profile change::file change -> ~root/.bash_profile::content::-
+			email([administrator])
+
+	[severity 3] --
+	[every 20] --
+		root user bashrc change::file change -> ~root/.ssh::content::-
+			email([administrator])
+}
+enddef
+
+# detect any changes to core startup processes
+ifdef LINUX
+{ check startup processes
+
+	[severity 1] --
+	[every 10] --
+		check startup processes::file change -> /etc/init.d/*::--
+			content recurse:3::--
+			email([administrator])
+}
+enddef
+
+ifdef MAC OS X
+{ check startup processes
+
+	[severity 1] --
+	[every 10] --
+		check system startup processes::file change -> /System/Library/StartupItems/*::--
+			content recurse:3::--
+			email([administrator])
+			
+	[severity 1] --
+	[every 10] --
+		check local startup processes::file change -> /Library/StartupItems/*::--
+			content recurse:3::--
+			email([administrator])
+			
+}
+enddef
+
+# any serverM config changes
+
+	[severity 2] --
+	[every 10] --
+		serverm config file changes::file change -> %path/config/*.txt::--
+			content recurse:2::--
+			email([administrator])
+
+
+	[severity 2] --
+	[every 10] --
+		serverm library file changes::file change -> %path/lib/*.pm::--
+			content::--
+			email([administrator])
+
+
+	[severity 2] --
+	[every 10] --
+		serverm core file changes::file change -> %path/serverM::--
+			content::--
+			email([administrator])
+
+

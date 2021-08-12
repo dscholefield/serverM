@@ -1,0 +1,364 @@
+#!/usr/bin/perl -I lib
+
+# serverM remote monitor daemon (srm), part of
+# the serverM intrusion detection and protection system
+# D. Scholefield 2004, 2005, 2006 (www.port80.com)
+# Version 2.80 (Linux/Mac OS X/BSD)
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+# usage: srm <config.file>
+
+use strict;
+use parse_config;
+use DAEMONIZE;
+use IO::Socket::INET;
+use DBI;
+use Crypt::CBC;
+
+my $debug=1;
+my $version='0.9';
+
+our $cipher;
+
+$SIG{HUP}=\&catch_hup;
+$SIG{TERM}=\&catch_term;
+our $isHupped=0;
+our $isTermed=0;
+
+sub catch_hup
+{
+       our $isHupped++;
+}
+
+sub catch_term
+{
+        our $isTermed=1;
+}
+
+
+
+
+banner();
+my $config_file = $ARGV[0];
+if (! -e $config_file)
+{
+	print "cannot find config file '$config_file', aborting...\n";
+	exit;
+}
+
+my ($status, $rfErrors, $rfValues) = parse_config::parse(0,1,$config_file);
+
+if (!$status)
+{
+	print "ERROR IN CONFIG FILE:\n";
+	foreach my $value (@$rfErrors)
+	{
+		print "\t$value\n";
+	}
+	print "aborting....\n\n";
+	exit;
+}
+
+dump_config() if ($debug);
+
+# we need to check if logfile is writable, and that the database is connecting
+
+my $logfile = $rfValues->{'log-location'};
+$logfile=~s/\/$//;
+$logfile.='/srmlog';
+
+if (!open(outFile, ">>$logfile"))
+{
+	print "unable to open logfile '$logfile' for writing, aborting...\n\n";
+	exit;
+}
+else
+{close(OutFile);}
+
+our $dbh;
+$dbh=getConnection('srm', $rfValues->{'db-ip'}, $rfValues->{'db-user'}, $rfValues->{'db-pass'}) if $rfValues->{'db-ip'} ;
+
+add_to_log("srm system is starting");
+
+# we can pre-parse the rlog list to ensure maximum speed
+my %hosts=();
+
+my $ip; my $port; 
+
+foreach my $rlog (@{$rfValues->{'rlog'}})
+{
+	($ip, $port)=split(/\,/, $rlog);
+	$ip=~s/^\s+//; $ip=~s/\s+$//;
+	$port=~s/^\s+//; $port=~s/\s+$//;
+	
+	$hosts{$ip}=$port;
+	add_to_log("monitoring host '$ip' on UDP port '$port'");
+}
+
+my $key=$rfValues->{'key'};
+$key=~s/^\s+//; $key=~s/\s+$//;
+
+if ($key ne '')
+	{ init_cipher($key);} else { init_cipher('');}
+	
+
+# if the 'screen' parameter is set to 'yes' then we don't enter daemon mode
+# otherwise enter daemon mode and reliquish the standard pipes
+
+if ($rfValues->{'screen'} =~ /off/i) 
+   		{	print "entering Daemon mode "; DAEMONIZE::Init();}		
+    else
+    	{   print "in interactive mode, re-start with 'screen' option set to 'off' to run as daemon\n";}
+    
+    while(!$isTermed)
+    {
+    	if (!$isHupped) {main_loop();}
+    	else
+		{
+			if ($isHupped == 1) {Pause();}
+			else
+			{	
+				Continue(); $isHupped=0;
+			}
+		}
+    }
+
+add_to_log("srm is stopping");
+
+exit;
+
+sub main_loop
+{
+	# this is where the main work of the daemon is achieved
+	# execution time should be a quick as possible to avoid
+	# missing UDP messages
+	
+	foreach my $ip (keys %hosts)
+	{ 
+		my $msg=get_msg($hosts{$ip});
+		$msg=$cipher->decrypt($msg) if ($msg);
+		process_msg($msg) if ($msg);
+	}
+}
+
+sub pause
+{
+	# a HUP has been received and we are pausing
+	add_to_log("srm is pausing");
+}
+
+sub continue
+{
+	# we are paused and another HUP has been sent, we will continue
+	add_to_log("srm is continuing");
+}
+
+sub process_msg
+{	
+	my $msg=shift;
+	print "$msg\n" if ($rfValues->{'screen'} =~ /on/i);
+	add_to_log("rec: $msg");
+	
+	db_log_msg($msg);
+}
+
+sub db_log_msg
+{
+	my $msg=shift;
+	# we need to parse the log message
+	my $server;
+	my $timestamp;
+	my $check_cycle;
+	my $status;
+	my $txt;
+		
+	if ($msg =~ /\{([^\}]+)\}\s*([^\(]+)\(([0-9]+)\)\s+\[([a-zA-Z]+)\]\s+(.*)$/)
+	{
+		$server=$1; 
+		$timestamp=$2;
+		$check_cycle=$3;
+		$status=$4;
+		$txt=$5;
+		
+		$server=~s/^\s+//; $server=~s/\s+$//;
+		$timestamp=~s/^\s+//; $timestamp=~s/\s+$//;
+		$check_cycle=~s/^\s+//; $check_cycle=~s/\s+$//;
+		$status=~s/^\s+//; $status=~s/\s+$//;
+		$txt=~s/^\s+//; $txt=~s/\s+$//;
+		
+		my $time=time();
+	
+		# print "server=$server\ttimestamp=$timestamp\tcheck cycle=$check_cycle\tstatus=$status\ttxt=$txt\n" if ($debug);
+		my $safe_text= encode_safe_text($txt);
+		my $sql_statement='insert into log values(NULL,'."'".$server."',".$time.",'".$timestamp."',".$check_cycle.",'".$status."','".$safe_text."')";
+		executeSQL($sql_statement, $dbh) if $rfValues->{'db-ip'} ;
+	}
+	else
+	{ print "did not understand message $msg\n" if ($debug);
+		add_to_log("ERROR - received message '$msg' but could not parse");}
+	
+}
+
+sub banner()
+{ print<<ENDBANNER
+serverM remote monitor daemon (srm) Version $version
+[written by David Scholefield (www.port80.com)]
+	
+This software is protected by the Gnu Public License, you are free to
+copy and distribute. Please refer to the license reproduced in the
+LICENSE file in the original distribution for details.
+	
+ENDBANNER
+}
+
+sub dump_config 
+{
+	print "\nIn debug mode, dumping configuration file...\n";
+	foreach my $key (keys %$rfValues)
+	{
+		if ($key ne 'rlog') { print "$key -> $rfValues->{$key}\n";}
+		else
+		{
+			my @rlogs=@{$rfValues->{$key}};
+			foreach my $value (@rlogs)
+			{ 
+				my ($ip, $port, $key) = split(/\,/,$value);
+				print "ip=$ip\tport=$port\tkey=$key\n";
+			}
+		}
+	}
+}
+
+sub add_to_log
+{
+	my $msg=shift;
+	my $ltime=convert_timestamp();
+	open(OutFile, ">>$logfile"); print OutFile "$ltime $msg\n"; close(OutFile);
+}
+
+sub convert_timestamp
+{
+   	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime();
+	$year+=1900;
+	my $monName = (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[$mon];
+	my $dayName = (qw(Sun Mon Tue Wed Thu Fri Sat))[$wday];
+	
+	if ($sec<10) {$sec="0$sec";}
+	if ($min<10) {$min="0$min";}
+	if ($hour<10) {$hour="0$hour";}
+	
+	return "$dayName $mday $monName $year : $hour:$min:$sec";
+
+}
+
+sub get_msg
+{
+	my $port=shift; 
+	my $text;
+	
+	my $MySocket=new IO::Socket::INET->new(LocalPort=>$port,Proto=>'udp',Timeout=>'1');
+	$MySocket->recv($text,1024);
+	return $text;
+}
+
+
+sub getConnection{
+
+	my $currentDB = shift;
+	my $currentIP = shift;
+	my $currentUser = shift;
+	my $currentPass = shift;
+	
+	my $dbh = DBI->connect("DBI:mysql:$currentDB:$currentIP", 
+				$currentUser, $currentPass)
+		or die("Can't connect to database", "warning");
+
+	return $dbh;		# send the value back
+}
+
+# executeSQL receives a statement and a handle, and
+# executes the statement, returning a reference to the results
+# array of arrays prepended with the number of rows found
+# as a result of executing the statement
+
+sub executeSQL{
+	my ($sqlStatement, $dbh) = @_;
+	my @resultArray = ();				# this will hold the result arrays
+	my $resultRows = 0;				# this will hold the number of rows
+
+	# we'll enclose the SQL DBI stuff in an eval to catch the dies
+	eval 
+	{	
+		# DBI needs a 'prepare' for each SQL statement
+		my $sth = $dbh->prepare($sqlStatement);
+		# now try to execute it
+		if (!$sth->execute())
+		{
+			# print "+++", $dbh->errstr, "+++\n";  
+			return ($dbh->errstr, \[]);			# return empty results array
+												# and error in rows found
+		}
+		else
+		{
+			
+			# print "Inserted $sqlStatement\n";
+			$resultRows = $sth->rows();		# get the number of rows found
+
+			# we only need to return a dataset if there is a select
+			# statement
+
+			if ($sqlStatement =~ /^\s*select/i)
+			{
+				my @dataSet = ();
+				while(@dataSet = $sth->fetchrow_array())
+				{
+					push @resultArray,[@dataSet];	# bung results as anon ref into results
+									# array ready to hand back to caller
+				}
+			}
+
+			# we're going to keep the connection open so don't disconnect, just 'finish'
+			# the SQL statement appropriately
+
+			$sth->finish();
+		}
+	
+	};
+
+	return ($resultRows,\@resultArray);			# and send the results back
+}
+
+sub init_cipher {
+	my $key = shift;
+
+	$cipher=Crypt::CBC->new(-key => "$key", -cipher => 'Blowfish');
+}
+
+sub encode_safe_text{
+	my $inText = shift;
+	$inText =~ s/\'/##q##/g;
+	$inText =~ s/"/##qq##/g;
+	$inText =~ s/\0/##0##/g;
+	$inText =~ s/\\b/##b##/g;
+	$inText =~ s/\n/##n##/g;
+	$inText =~ s/\r/##r##/g;
+	$inText =~ s/\t/##t##/g;
+	$inText =~ s/\\/##bs##/g;
+	$inText =~ s/\%/##pc##/g;
+	$inText =~ s/_/##ul##/g;
+	
+	return $inText;
+}

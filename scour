@@ -1,0 +1,338 @@
+#!/usr/bin/perl
+
+# the *nix log file pattern detection program, part of
+# the serverM intrusion detection and protection system
+# D. Scholefield 2004, 2005, 2006 (www.port80.com)
+# Version 2.80 (Linux/Mac OS X/BSD)
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+use strict;
+use HTTP::Date;
+# set up variables to record results
+my $found_count=0;
+my @lines_found=();
+
+# set up variables to hold options
+my $count_opt=0;
+my $num_opt=0;
+my $list_opt=0;
+my $yesno_opt=0;
+my $from_date='0';
+my $verbose_opt=0;
+my $to_date='0';
+my $filename='';
+my $pattern='';
+my $previous='';
+my $is_prev=0;
+my $from_to=0;
+
+# define patterns for date strings
+my $month='Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec';
+my $day = '[1-9][0-9]*';
+my $time = '[0-9]{2}\:[0-9]{2}\:[0-9]{2}';
+
+parse_opts();
+
+if ($filename =~ /^\!(.*)$/)
+{
+	# we have a command to execute in order to generate the file!
+	my $cmd=$1;
+	print "executing command '$cmd'\n" if ($verbose_opt);
+	my @results=`$cmd`;
+	foreach my $line (@results)
+	{
+			process_line($line, $from_date, $to_date, $pattern);
+	}
+	report();
+}
+else
+{
+	if (open(InFile, "<$filename"))
+	{
+		while(my $line=<InFile>)
+		{
+			process_line($line, $from_date, $to_date, $pattern);
+		}
+		close(InFile);
+		report();
+	}
+	else
+	{
+		print "Error! Failed to open file '$filename'\n";
+		exit;
+	}
+}
+
+exit;
+
+sub process_line
+{
+	my ($line, $fdate, $tdate, $pat) = @_;
+
+	# print "Testing line $line against pattern '$pattern'\n" if ($verbose_opt);
+	
+	my $syslog_timepattern = '^'."((?:$month)".'\s+'."(?:$day)".'\s+'."(?:$time))".'\s+'."(.*)".'$';
+	my $apache_error_timepattern = '^\[((?:[A-Za-z]{3}\s+)'."($month)".'\s+'."($day)".'\s+'."($time)".'(?:\s+2[0-9]{3}))\]\s+'."(.*)".'$';
+	my $apache_access_timepattern = '^(?:[^\[]+)\[([^\[]+)\]\s+(.*)';
+	
+
+	if ((($line=~/$syslog_timepattern/) || ($line=~/$apache_error_timepattern/) || ($line=~/$apache_access_timepattern/)) && ($is_prev || $from_to))
+	{
+		my $epoch=str2time($1);
+		my $rest_line;
+		$rest_line=$2;
+		# print "Epoch is $epoch, fdate is $fdate, tdate is $tdate for $rest_line\n" if ($verbose_opt);
+		if ($epoch >= $fdate) 
+		{ if ($epoch <= $tdate)
+		{ if ($line =~ /$pattern/)
+		   
+		{
+			$found_count++; push @lines_found, $line;
+			print "MATCH FOUND++ $line ++\n" if ($verbose_opt);
+		}}}
+	}
+	else
+	{
+		if ((!$is_prev && !$from_to) && ($line =~ /$pattern/))
+		{
+			$found_count++; push @lines_found, $line;
+			print "MATCH FOUND++ $line ++\n" if ($verbose_opt);
+		}
+	}
+}
+
+sub report
+{
+	print "Num found: $found_count\n" if ($verbose_opt);
+	if ($num_opt <= $found_count)
+	{
+		if ($yesno_opt)
+		{ print "1"; exit;}
+		else
+		{
+			list_found() if ($list_opt);
+			exit if ($list_opt);
+			print "$found_count\n" if ($count_opt);
+			exit if ($count_opt);
+		}
+	}
+	else
+	{
+		if ($yesno_opt)
+		{ print "0"; exit;}
+		else
+		{
+			
+			list_found() if ($list_opt);
+			exit if ($list_opt);
+			print "$found_count\n" if ($count_opt);
+			exit if ($count_opt);
+		}
+	}
+}
+
+sub list_found
+{
+	foreach my $line (@lines_found)
+	{ print "$line";}
+}
+
+sub parse_opts
+{
+	# expecting 
+	# from:'date string'
+	# to:'date string'
+	# file:'filename'
+	# pattern:'pattern'
+	# num:<number> (number of times pattern is expected)
+	# -count (to give a count)
+	# -list (to give a list)
+	# -yesno (to return 0 or 1)
+	# list, count, and yesno are mutually exclusive
+	# previous:'times' defines the last n hours, mins, secs
+	# in the format hh::mm::ss
+
+	my $exclusive=0;
+	my $exc_dates=0;
+
+	
+	ARG: foreach my $arg (@ARGV)
+	{
+
+	if ($arg =~ /-h/)
+	{
+		do_use();
+		exit;
+	}
+	if ($arg =~ /file:\'?(.*)\'?/i)
+	{
+		$filename=$1;
+		next ARG;
+	}
+	if ($arg =~ /previous:\'?([0-9]{2,})\:([0-9]{2})\:([0-9]{2})\'?/)
+	{
+		my ($hr, $mn, $sc) = ($1, $2, $3);
+		my $nw=time();
+		$to_date=$nw;
+		$nw-=($hr*60*60);
+		$nw-=($mn*60)+$sc;
+		$from_date=$nw;
+		$exc_dates++;
+		$is_prev=1;
+		next ARG;
+	}
+		
+	if ($arg =~ /-list/)
+	{
+		$list_opt=1;
+		$exclusive++;
+		next ARG;
+	}
+	
+	if ($arg =~ /-v(?:erbose)?/)
+	{
+		$verbose_opt=1;
+		next ARG;
+	}
+	if ($arg =~ /-count/)
+	{
+		$count_opt=1;
+		$exclusive++;
+		next ARG;
+	}
+
+	if ($arg =~ /-yesno/)
+	{
+		$yesno_opt=1;
+		$exclusive++;
+		next ARG;
+	}
+	
+	if ($arg =~ /pattern:\'?(.*)\'?/i)
+	{
+		$pattern=$1;
+		next ARG;
+	}
+
+	if ($arg =~ /num:\'?([0-9]+)\'?/i)
+	{
+		$num_opt=$1;
+		next ARG;
+	}
+	
+	if ($arg =~ /from:\'?(.+)\'?/i)
+	{
+		$from_date=$1;
+		$exc_dates++;
+		$from_to=1;
+		next ARG;
+	}
+	
+	if ($arg =~ /to:\'?(.+)\'?/i)
+	{
+		$to_date=$1;
+		$exc_dates++;
+		$from_to=1;
+		next ARG;
+	}
+	print "Don't understand option $arg\n";
+	do_use();
+	exit;
+	}
+
+if (($is_prev) && ($exc_dates>1))
+{
+	print "use of previous mutually exclusive with\n";
+	print "from: and to:\n";
+	do_use();
+	exit;
+}
+
+if ($exclusive>1)
+{
+	print "use of count, list, and yesno options must\n";
+	print "be exclusive\n";
+	do_use();
+	exit;
+}
+
+if (($from_date ne '0') && (!$is_prev))
+{
+	print "Converting from date '$from_date' to " if ($verbose_opt);
+	$from_date=str2time($from_date);
+	print "$from_date\n" if ($verbose_opt);
+}
+
+if ($to_date eq '0')
+{ $to_date = '2037-12-31 23:59:59';}
+
+print "Converting to date '$to_date' to " if ($verbose_opt);
+$to_date=str2time($to_date) if (!$is_prev);
+print "$to_date\n" if ($verbose_opt);
+
+
+if ($verbose_opt)
+{
+	print "Count option: $count_opt\n";
+	print "Num option: $num_opt\n";
+	print "List option: $list_opt\n";
+	print "yesno option: $yesno_opt\n";
+	print "From date: $from_date\n";
+	print "Verbose option: $verbose_opt\n";
+	print "To date: $to_date\n";
+	print "Filename: $filename\n";
+	print "Pattern: $pattern\n";
+}
+}
+
+sub do_use
+{
+print<<ENDUSE
+
+	scour version 1.0 (c) D Scholefield 2005
+
+	usage: scour [options] file:<logfile> pattern:<pattern>
+
+	[-list] 		list lines from logfile that match constraints
+	[-count] 		show count of number of lines in logfile that match constaints
+	[-yesno]		show either '0' or '1' depending on whether any lines were found
+	[previous:<time>] 	only consider lines in logfile added in previous <time> (see below)
+	[num:<num>]		look for at least 'num' numver of lines (used with -yesno option) 
+	[from:<date>] 		bound serach to those lines added on or after date (see below)
+	[to:<date>]		bound search to those lines added on or before date (see below)
+	[-verbose]		be verbose with reporting
+
+	<time> is defined in format 'hh:mm:ss' with or wirhout quotes
+	<date> is in Unix date string format 'YYYY-MM-DD HH:MM::SS"
+	<pattern> is any Perl regular expression
+
+	list, count, and yesno options are mutually exclusive
+	'previous' is mutually exclusive to 'from' and 'to' options
+
+	examples:
+	1) look for entries in log file with 'Authentication failure' that have been added in 
+	the last hour, and list the lines found
+
+	scour -list previous:'01:00:00' pattern:'Authentication failure' file:'/var/log/system.log'
+
+	2) look for shutdown entries that have occurred between two dates and return
+	a '0' or '1' if there have been more than three occasions
+
+	scour -yesno from:'2005-11-11 00:00:00' to:'2005-11-15 23:59:59' num:4 \
+		pattern:'shutdown: halt' file:'/var/log/system.log'
+ 		
+ENDUSE
+} 

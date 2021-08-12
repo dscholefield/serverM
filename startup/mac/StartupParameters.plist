@@ -1,0 +1,10 @@
+{
+  Description     = "serverM server";
+  Provides        = ("serverM");
+  OrderPreference = "None";
+  Messages =
+  {
+    start = "Starting serverM service";
+    stop  = "Stopping serverM service";
+  };
+}
